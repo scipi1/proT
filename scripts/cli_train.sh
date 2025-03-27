@@ -1,0 +1,1 @@
+python cli.py train --exp_id test --debug True
