@@ -3,6 +3,9 @@ import logging
 import os
 from datetime import datetime
 from pytorch_lightning import seed_everything
+import glob
+import re
+import os
 
 def set_seed(seed=42):
     """
@@ -47,3 +50,35 @@ def mk_fname(filename: str,label: str,suffix: str):
     now = datetime.now()
     timestamp = now.strftime("%Y%m%d_%H%M%S") # format YYYYMMDD_HHMMSS
     return filename+"_"+str(label)+f"_{timestamp}"+suffix
+
+
+
+
+
+def find_last_checkpoint(checkpoint_dir):
+    checkpoint_files = glob.glob(os.path.join(checkpoint_dir, "epoch=*-train_loss=*.ckpt"))
+    if not checkpoint_files:
+        return None  # No checkpoints found
+
+    # Regex to extract epoch number
+    pattern = re.compile(r"epoch=(\d+)-train_loss=.*\.ckpt")
+
+    def extract_epoch(file):
+        match = pattern.search(file)
+        return int(match.group(1)) if match else -1
+
+    # Find the checkpoint with the highest epoch number
+    last_checkpoint = max(checkpoint_files, key=extract_epoch, default=None)
+    return last_checkpoint
+
+
+
+
+if __name__ == "__main__":
+    
+    # test for find_last_checkpoint
+    checkpoint_dir = r"C:\Users\ScipioneFrancesco\Documents\Projects\prochain_transformer\experiments\training\cluster\dx_250324_base_25\sweeps\sweep_enc_pos_emb_hidden\sweep_enc_pos_emb_hidden_100\k_0\checkpoints"
+    last_ckpt = find_last_checkpoint(checkpoint_dir)
+    print("Last checkpoint:", last_ckpt)
+    
+    

@@ -19,6 +19,8 @@ class TransformerForecaster(pl.LightningModule):
     def __init__(self, config):
         super().__init__()
         
+        self.automatic_optimization = False
+        
         self.config = config
         self.dynamic_kwargs = {
             "enc_mask"              : None,
@@ -26,7 +28,6 @@ class TransformerForecaster(pl.LightningModule):
             "dec_cross_mask"        : None}
         
         self.val_idx = config["data"]["val_idx"]
-        # TODO: incorporate ds_embed_enc/dec into config
         
         self.model = Spacetimeformer(
             
@@ -73,7 +74,10 @@ class TransformerForecaster(pl.LightningModule):
             )
         
         if config["training"]["loss_fn"] == "mse":
-            self.loss_fn = nn.MSELoss()
+            self.loss_fn = nn.MSELoss(reduction="none")
+            
+        self.switch_epoch = config["training"]["switch_epoch"]
+        self._switched    = False 
             
         self.save_hyperparameters(ignore=['loss_fn'])
         
@@ -92,13 +96,13 @@ class TransformerForecaster(pl.LightningModule):
         dec_input = data_trg.clone()
         dec_input[:, :, self.val_idx] = 0
         
-        forecast_output, recon_output, (enc_self_attns, dec_cross_attns) = self.model.forward(
+        forecast_output, recon_output, (enc_self_attns, dec_cross_attns), enc_mask = self.model.forward(
             input_tensor=encoder_in,
             target_tensor=dec_input)
             #**self.dynamic_kwargs)
         
         
-        return forecast_output, recon_output, (enc_self_attns, dec_cross_attns)
+        return forecast_output, recon_output, (enc_self_attns, dec_cross_attns), enc_mask
     
     def set_kwargs(self, kwargs):
         self.dynamic_kwargs = kwargs
@@ -108,33 +112,233 @@ class TransformerForecaster(pl.LightningModule):
         X, Y = batch
         
         
-        predict_out,_,_ = self.forward(data_input=X, data_trg=Y, kwargs=self.dynamic_kwargs)
+        predict_out,_,_, enc_mask = self.forward(data_input=X, data_trg=Y, kwargs=self.dynamic_kwargs)
         
         trg = torch.nan_to_num(Y[:,:,self.val_idx])
+                
+        mse_per_elem  = self.loss_fn(predict_out.squeeze(), trg.squeeze())
         
-        
-        
-        loss = self.loss_fn(predict_out.squeeze(), trg.squeeze())
+        loss = mse_per_elem.mean()
         return loss, predict_out, Y
         
-    def training_step(self,batch):
-        loss,_, _ = self._step(batch=batch)
-        self.log("train_loss",loss,prog_bar=True, on_step=False, on_epoch=True)
+    
+    def training_step(self, batch, batch_idx):
+        
+        # forward step
+        loss,_,_ = self._step(batch=batch)
+        
+        if loss.isnan().any():
+            breakpoint()
+        
+        # one backward pass for all parameters
+        self.manual_backward(loss)
+        
+        # gradient clipping
+        if self.config["training"]["optimization"] in [1,2,3]:
+            nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+        
+        
+        
+        if self.config["training"]["optimization"] == 1:
+            """
+            Same Adam optimizer for embeddings and model parameters.
+            """
+            
+            # get optimizer
+            opt = self.optimizers()
+            
+            # optimizer steps & zero_grad
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+        
+        
+        
+        elif self.config["training"]["optimization"] in [2,5]:
+            """
+            Adam optimizer for embeddings and model parameters with different learning rates.
+            """
+            
+            # get optimizers
+            opt_emb, opt_model = self.optimizers()
+            
+            # optimizer steps & zero_grad
+            opt_emb.step()
+            opt_model.step()
+            opt_emb.zero_grad(set_to_none=True)
+            opt_model.zero_grad(set_to_none=True)
+        
+        
+        
+        elif self.config["training"]["optimization"] in [3,4]:
+            """
+            Embedding optimizer runs in two phases: a first phase with Adagrad, and a second with Adam.
+            """
+            
+            # get optimizers
+            opt_emb, opt_model, opt_emb_steady = self.optimizers()
+
+            
+            # switch to Adam for embeddings
+            if (not self._switched) and (self.current_epoch >= self.switch_epoch):
+                
+                if self.config["training"]["optimization"] in [4,5]:
+                    
+                    for p in opt_emb.param_groups[0]['params']:
+
+                        # ensure Adam buffers exist
+                        adam_state = opt_emb_steady.state[p]
+                        
+                        # reset Adam state
+                        adam_state['exp_avg']     = torch.zeros_like(p)
+                        adam_state['exp_avg_sq']  = torch.zeros_like(p)
+                        adam_state['step']        = torch.tensor(0., dtype=torch.float32)
+                
+                # switch to steady optimizer
+                self.optimizers()[0] = opt_emb_steady          
+                self._switched = True
+            
+            # optimizer steps & zero_grad
+            opt_emb.step()            
+            opt_model.step()          
+            opt_emb.zero_grad(set_to_none=True)
+            opt_model.zero_grad(set_to_none=True)
+        
+        self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        
         return loss
+    
     
     def validation_step(self,batch,batch_idx):
         loss,_,_ = self._step(batch=batch)
         self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
     
+    
     def test_step(self,batch,batch_idx):
-        loss,predict_out, y_val = self._step(batch=batch)
+        loss,_,_ = self._step(batch=batch)
         self.log("test_loss", loss)
         return loss
+    
     
     def predict_step(self,batch,batch_idx):
         _,predict_out,y_val = self._step(batch=batch)
         return predict_out,y_val
     
+    
+    def split_params(self):
+        enc_emb_params = list(self.model.enc_embedding.embed_modules_list.parameters())
+        dec_emb_params = list(self.model.dec_embedding.embed_modules_list.parameters())
+        emb_param_ids = {id(p) for p in enc_emb_params + dec_emb_params}
+        other_params = [p for p in self.model.parameters() if id(p) not in emb_param_ids]
+        
+        return enc_emb_params,dec_emb_params, other_params
+    
+    
+    
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(),lr=self.config["training"]["learning_rate"])
+        
+        assert self.config["training"]["optimization"] in [1,2,3,4,5], AssertionError("Invalid optimization method")
+        
+        if self.config["training"]["optimization"] == 1:
+            """
+            Same Adam optimizer for embeddings and model parameters.
+            """
+            optimizer = torch.optim.Adam(self.parameters(),lr=self.config["training"]["base_lr"])
+            
+            return optimizer
+        
+            
+        elif self.config["training"]["optimization"] == 2:
+            """
+            Adam optimizer for embeddings and model parameters with different learning rates.
+            Scheduler for the model parameters to kick in after a few epochs.
+            """
+            
+            # get parameters
+            enc_emb_params, dec_emb_params, other_params = self.split_params()
+            
+            # optimizers
+            opt_emb   = torch.optim.Adam(enc_emb_params+dec_emb_params, lr=self.config["training"]["emb_lr"], betas=(0.9, 0.95))
+            opt_model   = torch.optim.Adam(other_params, lr=self.config["training"]["base_lr"], betas=(0.9, 0.95))
+            
+            # schedulers
+            sched = torch.optim.lr_scheduler.StepLR(opt_model, step_size=self.config["training"]["warmup_steps"], gamma=0.5)
+            
+            scheduler_model = {
+                "scheduler": sched,
+                "interval": "epoch",        # update every batch
+            }
+            
+            return [opt_emb,opt_model], [scheduler_model]
+        
+        
+        if self.config["training"]["optimization"] == 3:
+            """
+            Embedding optimizer runs in two phases: a first phase with Adagrad, and a second with Adam.
+            Scheduler for the model parameters to kick in after a few epochs.
+            """
+            
+            # get parameters
+            enc_emb_params, dec_emb_params, other_params = self.split_params()
+            
+            # optimizers
+            opt_emb_init =torch.optim.Adagrad(enc_emb_params,  lr=self.config["training"]["emb_start_lr"], lr_decay=0.0, eps=1e-10)
+            opt_emb_steady = torch.optim.Adam(enc_emb_params,  lr=self.config["training"]["emb_lr"], betas=(0.9, 0.95),weight_decay=0.0)
+            opt_model   = torch.optim.Adam(other_params+dec_emb_params, lr=self.config["training"]["base_lr"], betas=(0.9, 0.95))
+            
+            # schedulers
+            scheduler_model = {
+                "scheduler": torch.optim.lr_scheduler.StepLR(opt_model, step_size=self.config["training"]["warmup_epochs"], gamma=0.5),
+                "interval": "epoch",
+                }
+            
+            return [opt_emb_init, opt_model, opt_emb_steady], [scheduler_model]
+        
+        
+        if self.config["training"]["optimization"] == 4 :
+            """
+            Embedding optimizer runs in two phases: a first phase with Adagrad, and a second with AdamW.
+            Scheduler for the model parameters to kick in after a few epochs.
+            """
+            
+            # get parameters
+            enc_emb_params, dec_emb_params, other_params = self.split_params()
+            
+            
+            other_params += dec_emb_params + enc_emb_params[2:]
+                        
+            # optimizers
+            opt_emb_init =torch.optim.Adagrad(enc_emb_params[:2],  lr=self.config["training"]["emb_start_lr"], lr_decay=0.0, eps=1e-10)
+            opt_emb_steady = torch.optim.SparseAdam(enc_emb_params[:2], lr=self.config["training"]["emb_lr"], betas=(0.9, 0.95))
+            opt_model   = torch.optim.Adam(other_params, lr=self.config["training"]["base_lr"], betas=(0.9, 0.95))
+            
+            # schedulers
+            scheduler_model = {
+                "scheduler": torch.optim.lr_scheduler.StepLR(opt_model, step_size=self.config["training"]["warmup_epochs"], gamma=0.5),
+                "interval": "epoch",
+                }
+            
+            return [opt_emb_init, opt_model, opt_emb_steady], [scheduler_model]
+        
+        
+        if self.config["training"]["optimization"] == 5:
+            """
+            Embedding optimizer runs in two phases: a first phase with Adagrad, and a second with AdamW.
+            Scheduler for the model parameters to kick in after a few epochs.
+            """
+            
+            # get parameters
+            enc_emb_params, dec_emb_params, other_params = self.split_params()
+            other_params += dec_emb_params + enc_emb_params[2:]
+                        
+            # optimizers
+            opt_emb = torch.optim.SparseAdam(enc_emb_params[:2], lr=self.config["training"]["emb_lr"], betas=(0.9, 0.95))            
+            opt_model   = torch.optim.Adam(other_params, lr=self.config["training"]["base_lr"], betas=(0.9, 0.95))
+            
+            # schedulers
+            scheduler_model = {
+                "scheduler": torch.optim.lr_scheduler.StepLR(opt_model, step_size=self.config["training"]["warmup_epochs"], gamma=0.5),
+                "interval": "epoch",
+                }
+            
+            return [opt_emb, opt_model], [scheduler_model]

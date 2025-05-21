@@ -75,7 +75,7 @@ class DecoderLayer(nn.Module):
         dec_input_pos: torch.Tensor):
         
         
-        X1 = self.norm1(X)
+        X1 = self.norm1(X, ~self_mask_miss_q)
         
         X1, _ = self.global_self_attention(
             query=X1,
@@ -88,7 +88,7 @@ class DecoderLayer(nn.Module):
         
         X = X + self.dropout_attn_out(X1)
         
-        X1 = self.norm2(X)
+        X1 = self.norm2(X, ~self_mask_miss_q)
         
         
         X1, attn = self.global_cross_attention(
@@ -102,8 +102,9 @@ class DecoderLayer(nn.Module):
             
         X = X + self.dropout_attn_out(X1)
 
-        X1 = self.norm3(X)
+        X1 = self.norm3(X, ~self_mask_miss_q)
         
+        # TODO: give options
         # feedforward layers as 1x1 convs
         # X1 = self.dropout_ff(self.activation(self.conv1(X1.transpose(-1, 1))))
         # X1 = self.dropout_ff(self.conv2(X1).transpose(-1, 1))
@@ -113,9 +114,9 @@ class DecoderLayer(nn.Module):
         X1 = self.dropout_ff(self.linear2(X1))
         
         # final res connection
-        output = X + X1
+        decoder_out = X + X1
 
-        return output, attn
+        return decoder_out, attn
     
     
 class Decoder(nn.Module):
@@ -154,6 +155,6 @@ class Decoder(nn.Module):
             attn_list.append(attn)
 
         if self.norm_layer is not None:
-            X = self.norm_layer(X)
+            X = self.norm_layer(X, ~self_mask_miss_q)
 
         return X, attn_list

@@ -172,9 +172,13 @@ class Spacetimeformer(nn.Module):
         
         # embed input and get mask for missing values
         enc_input = self.enc_embedding(X=input_tensor)
-        enc_input_pos = self.enc_embedding.pass_var(X=input_tensor)
+        enc_input_pos = self.enc_embedding.pass_var(X=input_tensor) #TODO still relevant?
         enc_mask = self.enc_embedding.get_mask(X=input_tensor)
-                
+        
+        # scale embedding with missing data
+        # scale = enc_mask.shape[1]/torch.sum(~enc_mask.squeeze(),axis=-1, keepdim=True)
+        # enc_input *= scale.unsqueeze(-1)
+        # enc_input*= ~enc_mask
         
         # pass embedded input to encoder
         enc_out, enc_self_attns = self.encoder(
@@ -189,6 +193,7 @@ class Spacetimeformer(nn.Module):
         dec_input_pos = self.dec_embedding.pass_var(X=target_tensor)
         dec_self_mask=self.dec_embedding.get_mask(X=target_tensor)
         
+        
         # pass embedded target and encoder output to decoder
         dec_out, dec_cross_attns = self.decoder(
             X=dec_input,
@@ -199,13 +204,12 @@ class Spacetimeformer(nn.Module):
             cross_mask_miss_q=dec_self_mask,
             dec_input_pos = dec_input_pos
             )
-        
         # forecasting predictions
         forecast_out = self.forecaster(dec_out)
         # reconstruction predictions
         recon_out = self.reconstructor(enc_out)
         
-        return forecast_out, recon_out, (enc_self_attns, dec_cross_attns) #TODO maybe add dec_self_att to be fair
+        return forecast_out, recon_out, (enc_self_attns, dec_cross_attns), enc_mask #TODO maybe add dec_self_att to be fair
     
     
     def _attn(

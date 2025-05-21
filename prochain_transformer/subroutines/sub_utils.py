@@ -34,15 +34,19 @@ def mk_missing_folders(folders):
             makedirs(folder)
             print(f"Created folder: {folder}")
 
+
+
 def mk_fname(filename: str,label: str,suffix: str):
     now = datetime.now()
     timestamp = now.strftime("%Y%m%d_%H%M%S") # format YYYYMMDD_HHMMSS
     return filename+"_"+str(label)+f"_{timestamp}"+suffix
 
 
-def save_output(src_trg_list: List[tuple], output_path: str)->None:
-    """saves multiple files in a common destination
 
+
+def save_output(src_trg_list: List[tuple], output_path: str)->None:
+    """
+    saves multiple files in a common destination
     Args:
         src_trg_list List(tuple): list of tuples with (file,file_name)
         output_path (str): output destination where the files are saved
@@ -56,7 +60,9 @@ def save_output(src_trg_list: List[tuple], output_path: str)->None:
             np.save(f, source)
 
 
-def load_model(exp_id: str, checkpoint: str, standard_path: bool = True):
+
+
+def load_model(exp_id: str, checkpoint: str, standard_path: bool=True):
 
     if standard_path:
         ROOT_DIR = dirname(dirname(dirname(abspath(__file__))))
@@ -72,6 +78,8 @@ def load_model(exp_id: str, checkpoint: str, standard_path: bool = True):
     model_resumed = model.load_from_checkpoint(checkpoint_path)
 
     return model_resumed
+
+
 
 
 def load_dataset(exp_id: str, standard_path: bool = True):
@@ -96,6 +104,9 @@ def load_dataset(exp_id: str, standard_path: bool = True):
     dm.setup(stage=None)
 
     return dm
+
+
+
 
 def predict_save(
     model: pl.LightningModule,
@@ -126,6 +137,9 @@ def predict_save(
     output_path=output_path
     )
 
+
+
+
 def get_masks_from_template(template_path=None,exp_id=None):
 
     if template_path is None and exp_id is not None:
@@ -151,6 +165,9 @@ def get_masks_from_template(template_path=None,exp_id=None):
         col_dict[col] = items_dict
 
     return col_dict
+
+
+
 
 def get_masks_len(masks: dict)-> dict:
 

@@ -71,17 +71,17 @@ class identity_emb(nn.Module):
         self.device = device
     
     def forward(self, X: torch.Tensor):
-        indentity_fun = nn.Identity()
+        indentity_fun = nn.Identity(device=self.device, dtype=torch.float32)
         return indentity_fun(X.unsqueeze(-1))
 
 
 
 
 class nn_embedding(nn.Module):
-    def __init__(self, num_embeddings,embedding_dim, device):
+    def __init__(self, num_embeddings,embedding_dim, device, *args, **kwargs):
         super().__init__()
         self.embed_dim = embedding_dim
-        self.embedding = nn.Embedding(num_embeddings, embedding_dim, device=device)
+        self.embedding = nn.Embedding(num_embeddings, embedding_dim, device=device, dtype=torch.float32, *args, **kwargs)
     
     def forward(self, X: torch.Tensor):
         if self.embed_dim == 0:
@@ -89,6 +89,16 @@ class nn_embedding(nn.Module):
         else:
             return self.embedding(X)
 
+
+
+class linear_emb(nn.Module):
+    def __init__(self, input_dim, embedding_dim, device):
+        super().__init__()
+        self.embedding = nn.Linear(in_features=input_dim, out_features=embedding_dim, device=device, dtype=torch.float32)
+        
+    def forward(self, X: torch.Tensor):
+        return self.embedding(X.unsqueeze(-1))
+        
 
 
 

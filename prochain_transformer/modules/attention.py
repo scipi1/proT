@@ -37,13 +37,13 @@ class ScaledDotAttention(nn.Module):
         # scores = torch.einsum("blhe,bshe->bhls", query, key)
         scores = torch.einsum("ble,bse->bls", query, key)
         
-        if pos is not None:
-            """
-            Attention with Linear Bias for positions
-            (reference https://arxiv.org/abs/2108.12409)
-            """
-            m = .5
-            scores += m*pos.nan_to_num()
+        # if pos is not None:
+        #     """
+        #     Attention with Linear Bias for positions
+        #     (reference https://arxiv.org/abs/2108.12409)
+        #     """
+        #     m = .5
+        #     scores += m*pos.nan_to_num()
         
         
         if mask_miss_k is not None:
@@ -58,7 +58,7 @@ class ScaledDotAttention(nn.Module):
             M_k = torch.zeros_like(scores).masked_fill_(mask_miss_k_expanded,-torch.inf)
             M_q = torch.zeros_like(scores).masked_fill_(mask_miss_q_expanded,-torch.inf)
             att = torch.relu(torch.softmax(scale * (scores + M_k), dim=-1) + M_q)
-            
+
         else:
             att = torch.softmax(scale * scores, dim=-1)
             
@@ -66,6 +66,7 @@ class ScaledDotAttention(nn.Module):
         A = torch.nan_to_num(self.dropout(att))
         
         V = torch.einsum("bsl,bsd->bsd", A, value)
+        
         
         return (V.contiguous(), A)
 

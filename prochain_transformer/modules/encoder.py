@@ -47,8 +47,9 @@ class EncoderLayer(nn.Module):
     def forward(self, X: torch.Tensor, mask_miss_k: torch.Tensor, mask_miss_q: torch.Tensor, enc_input_pos: torch.Tensor):
         
         # uses pre-norm Transformer architecture
-        attn = None
-        X1 = self.norm1(X)
+        
+        X1 = self.norm1(X, ~mask_miss_q)
+        
         
         # self-attention queries=keys=values=X
         X1, attn = self.global_attention(
@@ -63,6 +64,9 @@ class EncoderLayer(nn.Module):
         # resnet
         X = X + self.dropout_attn_out(X1)
         
+        X1 = self.norm2(X, ~mask_miss_q)
+        
+        
         # feedforward layers (done here as 1x1 convs)
         # X1 = self.dropout_ff(self.activation(self.conv1(X1.transpose(-1, 1))))
         # X1 = self.dropout_ff(self.conv2(X1).transpose(-1, 1))
@@ -72,6 +76,7 @@ class EncoderLayer(nn.Module):
         X1 = self.dropout_ff(self.activation(self.linear1(X1)))
         X1 = self.dropout_ff(self.linear2(X1))
         
+        # final res connection
         encoder_out = X + X1
         
         return encoder_out, attn
@@ -102,6 +107,6 @@ class Encoder(nn.Module):
             attn_list.append(attn)
             
         if self.norm_layer is not None:
-            X = self.norm_layer(X)
+            X = self.norm_layer(X, ~mask_miss_q)
 
         return X, attn_list

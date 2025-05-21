@@ -1,11 +1,24 @@
-from os import mkdir, listdir
+from os import listdir, makedirs
 from os.path import join, isdir, abspath, dirname, exists
 from typing import List, Callable
 import pandas as pd
+from pathlib import Path
 
 
 
-def get_df_recursive(filepath: str, bottom_action: Callable, lev: int=0)->pd.DataFrame:
+def has_logs_subfolder(directory: str) -> bool:
+    """
+    Check if the given directory contains at least one logs subfolder
+    """
+    directory_path = Path(directory)
+    target_folder = "logs"
+
+    return any(subdir.name == target_folder for subdir in directory_path.iterdir() if subdir.is_dir())
+
+
+
+
+def get_df_recursive(filepath: str, bottom_action: Callable, is_bottom: Callable, lev: int=0)->pd.DataFrame:
     """
     Loops recursively inside folders, keeping track of the various levels, until the bottom is reached
     At the bottom, performs the bottom_action.
@@ -25,7 +38,7 @@ def get_df_recursive(filepath: str, bottom_action: Callable, lev: int=0)->pd.Dat
     level_folders = [d for d in listdir(filepath) if isdir(join(filepath,d))]
     
     # check if bottom level is reached, condition might change for other applications
-    if "k" in level_folders[0]:
+    if is_bottom(join(filepath,level_folders[0])):
         df = bottom_action(filepath, level_folders)
     
     else:
@@ -40,7 +53,7 @@ def get_df_recursive(filepath: str, bottom_action: Callable, lev: int=0)->pd.Dat
             filepath_ = join(filepath,case)
             
             # recursive call
-            df_temp = get_df_recursive(filepath_, bottom_action, lev+1)
+            df_temp = get_df_recursive(filepath_, bottom_action, is_bottom, lev+1)
             
             # update sweep colums
             df_temp[f"level_{lev}"] = case
@@ -75,7 +88,7 @@ def get_df_kfold_loss(filepath: str, level_folders: List[str])->pd.DataFrame:
         "k": [],
         "val_loss": [],
         "train_loss": [],
-        "test_loss": []
+        # "test_loss": []
         }
     
     # loop over the bottom folders
@@ -97,24 +110,26 @@ def get_df_kfold_loss(filepath: str, level_folders: List[str])->pd.DataFrame:
     return pd.DataFrame().from_dict(cols)
 
 
-
-# filepath = "../training/dx_250318/sweeps/"
-def eval_sweeps(filepath: str, outpath: str):
-    df = get_df_recursive(filepath, get_df_kfold_loss)
-    df.to_csv(join(outpath,"eval_sweeps.csv"))
     
     
     
 if __name__ == "__main__":
     
-    exp_id = "dx_250318/sweeps/"
-    eval_id = "dx_250318_eval"
+    exp_id = "paper"
+    eval_id = "paper/full_field_sweep"
     ROOT_DIR = dirname(dirname(dirname(abspath(__file__))))
     filepath = join(ROOT_DIR,"experiments","training",exp_id)
     outpath = join(ROOT_DIR,"experiments","evaluations",eval_id)
     
     if not(exists(outpath)):
-        mkdir(outpath) 
+        makedirs(outpath)
         
+    df = get_df_recursive(
+        filepath=filepath, 
+        bottom_action=get_df_kfold_loss,
+        is_bottom=has_logs_subfolder)
     
-    eval_sweeps(filepath, outpath)
+    df.to_csv(join(outpath,"eval_sweeps.csv"))
+    
+    
+    

@@ -3,20 +3,21 @@ import logging
 from os.path import dirname, abspath, join
 import os
 import sys
-import yaml
 from os.path import abspath, join
 sys.path.append(dirname(dirname(abspath(__file__))))
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
 import torch
 from prochain_transformer.dataloader import ProcessDataModule
-from callbacks import early_stopping_callbacks, get_checkpoint_callback, MemoryLoggerCallback
+from callbacks import early_stopping_callbacks, get_checkpoint_callback, MemoryLoggerCallback, GradientLogger, LayerRowStats, MetricsAggregator
 from forecaster import TransformerForecaster
 from labels import *
 from subroutines.sub_utils import mk_missing_folders
 from pytorch_lightning import seed_everything
 from sklearn.model_selection import KFold
-from prochain_transformer.modules.utils import log_memory
+from prochain_transformer.predict import mk_quick_pred_plot
+from prochain_transformer.experiment_control import update_config
+from omegaconf import OmegaConf
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
@@ -26,7 +27,8 @@ def kfold_train(
     data_dir: str, 
     save_dir: str,
     cluster: bool, 
-    resume_ckpt: str=None, 
+    resume_ckpt: str=None,
+    plot_pred_check: bool=False,
     debug: bool=False,
     )->None:
     """
@@ -95,32 +97,46 @@ def kfold_train(
         save_dir_k = join(save_dir, f"k_{fold}") # make subfolder for the given fold
         logs_dir = join(save_dir_k, "logs")      # save dir for Tensorboard/CSV logs and checkpoints
         mk_missing_folders([logs_dir])
-    
+
         # define loggers and callbacks
         logger = TensorBoardLogger(save_dir=logs_dir, name="tensorboard")
         logger_csv = CSVLogger(save_dir=logs_dir, name="csv")
-        checkpoint_callback = get_checkpoint_callback(save_dir_k)
+        checkpoint_callback = get_checkpoint_callback(save_dir_k,config["training"]["save_ckpt_every_n_epochs"])        
+        
+        
+        callbacks_list = [
+            #early_stopping_callbacks, 
+            checkpoint_callback,
+            ]
+        
+        
+        if debug:
+            callbacks_list.append(MemoryLoggerCallback())
+            
+            
+        if config["special"]["mode"] == "debug_optimizer":
+            callbacks_list.append(GradientLogger())
+            callbacks_list.append(LayerRowStats(layer_name="encoder_variable"))
+            callbacks_list.append(LayerRowStats(layer_name="encoder_position"))
+            callbacks_list.append(LayerRowStats(layer_name="final_ff"))
+            # callbacks_list.append(MetricsAggregator())
         
         
         # update ds
         dm.update_idx(train_idx=train_local_idx, val_idx=val_local_idx, test_idx=test_idx)
 
         trainer = pl.Trainer(
-            callbacks=[
-                #early_stopping_callbacks, 
-                checkpoint_callback, 
-                MemoryLoggerCallback()],
-            logger=[logger, logger_csv],
+            callbacks=callbacks_list,
+            logger=logger_csv, #[logger, logger_csv],
             accelerator="gpu" if torch.cuda.is_available() else "auto",
             devices=1 if cluster else "auto",
-            overfit_batches=1 if debug else 0,
+            #overfit_batches=1 if debug else 0,
             max_epochs=config["training"]["max_epochs"],
-            log_every_n_steps=1, #if debug else 10,
+            log_every_n_steps= 1,
             deterministic=True,
             enable_progress_bar=False if cluster else True,  # Disables the progress bar
             enable_model_summary=False if cluster else True,
-            #gradient_clip_val=0.5,
-            #detect_anomaly=True,
+            detect_anomaly=True if debug else False,
         )
         # * other stuff we can do
         # trainer.tune() to find optimal hyperparameters
@@ -133,7 +149,9 @@ def kfold_train(
 
         trainer.validate(model, dm)
         trainer.test(model, dm)
-        
+    
+    if plot_pred_check:
+        mk_quick_pred_plot(model=model, dm=dm, val_idx=config["data"]["val_idx"], save_dir=save_dir)
 
 
 
@@ -144,18 +162,21 @@ if __name__ == "__main__":
     """
     
     ROOT_DIR = dirname(dirname(abspath(__file__)))
-    exp_dir = join(ROOT_DIR, "experiments/test/")
+    exp_dir = join(ROOT_DIR, "experiments/training/test/")
     data_dir = join(ROOT_DIR, "data/input/")
     
-    with open(join(exp_dir,"config.yaml"), 'r') as file:
-        config = yaml.safe_load(file)
+    
+    config = OmegaConf.load(join(exp_dir,"config.yaml"))
+    config_updated = update_config(config)
+    
     
     save_dir = exp_dir
     
     kfold_train(
-        config = config, 
+        config = config_updated, 
         data_dir = data_dir, 
         save_dir = save_dir, 
         cluster = False, 
-        resume_ckpt = None, 
+        resume_ckpt = None,
+        plot_pred_check = True,
         debug = True)
