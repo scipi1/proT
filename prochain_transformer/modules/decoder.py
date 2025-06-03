@@ -90,16 +90,14 @@ class DecoderLayer(nn.Module):
         
         X1 = self.norm2(X, ~self_mask_miss_q)
         
-        
         X1, attn = self.global_cross_attention(
             query=X1,
             key=enc_out,
-            value=X1,
+            value=enc_out,
             mask_miss_k=cross_mask_miss_k,
             mask_miss_q=cross_mask_miss_q,
             pos = None
         )
-            
         X = X + self.dropout_attn_out(X1)
 
         X1 = self.norm3(X, ~self_mask_miss_q)

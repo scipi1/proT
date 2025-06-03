@@ -111,7 +111,7 @@ class Spacetimeformer(nn.Module):
         attn_dec_cross_kwargs = {
             "d_model_queries"   : d_model_dec,
             "d_model_keys"      : d_model_enc,
-            "d_model_values"    : d_model_dec,
+            "d_model_values"    : d_model_enc,
             "attention_type"    : dec_cross_attention_type,
             "mask_type"         : dec_cross_mask_type,
             "dropout_qkv"       : dec_cross_dropout_qkv,

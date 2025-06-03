@@ -18,6 +18,7 @@ from sklearn.model_selection import KFold
 from prochain_transformer.predict import mk_quick_pred_plot
 from prochain_transformer.experiment_control import update_config
 from omegaconf import OmegaConf
+from pytorch_lightning.callbacks import LearningRateMonitor
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
@@ -106,7 +107,7 @@ def kfold_train(
         
         callbacks_list = [
             #early_stopping_callbacks, 
-            checkpoint_callback,
+            cb for cb in checkpoint_callback
             ]
         
         
@@ -119,6 +120,7 @@ def kfold_train(
             callbacks_list.append(LayerRowStats(layer_name="encoder_variable"))
             callbacks_list.append(LayerRowStats(layer_name="encoder_position"))
             callbacks_list.append(LayerRowStats(layer_name="final_ff"))
+            callbacks_list.append(LearningRateMonitor(logging_interval="epoch"))
             # callbacks_list.append(MetricsAggregator())
         
         

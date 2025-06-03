@@ -65,7 +65,7 @@ class ScaledDotAttention(nn.Module):
         
         A = torch.nan_to_num(self.dropout(att))
         
-        V = torch.einsum("bsl,bsd->bsd", A, value)
+        V = torch.einsum("bsl,bld->bsd", A, value)
         
         
         return (V.contiguous(), A)
@@ -135,8 +135,8 @@ class AttentionLayer(nn.Module):
             )
         self.query_projection = nn.Linear(d_model_queries, d_queries_keys * n_heads)
         self.key_projection = nn.Linear(d_model_keys, d_queries_keys * n_heads)
-        self.value_projection = nn.Linear(d_model_values, d_model_values * n_heads)
-        self.out_projection = nn.Linear(d_model_values * n_heads, d_model_values)
+        self.value_projection = nn.Linear(d_model_values, d_model_queries * n_heads)
+        self.out_projection = nn.Linear(d_model_values * n_heads, d_model_queries)
         self.dropout_qkv = nn.Dropout(dropout_qkv)
         self.n_heads = n_heads
 
@@ -167,7 +167,7 @@ class AttentionLayer(nn.Module):
         else:
             query = self.dropout_qkv(self.query_projection(query)).view(B, L, -1)
             key = self.dropout_qkv(self.key_projection(key)).view(B, S, -1)
-            value = self.dropout_qkv(self.value_projection(value)).view(B, L, -1)
+            value = self.dropout_qkv(self.value_projection(value)).view(B, S, -1)
             
         out, attn = self.inner_attention(
             query=query,

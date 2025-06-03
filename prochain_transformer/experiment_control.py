@@ -344,7 +344,7 @@ def update_config(config: dict)->dict:
             config.model.dec_pos_emb_hidden = config.model.d_model_set
             config.model.dec_var_emb_hidden = config.model.d_model_set
     
-    if config.training.optimization in [4,5]:
+    if config.training.optimization in [3,4,5,6,7]:
         config.model.ds_embed_enc.set.sparse_grad = True
     
     

@@ -1,9 +1,12 @@
 import os
 from os.path import join, dirname, abspath
-from pytorch_lightning.callbacks import EarlyStopping,ModelCheckpoint
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning import Callback, Trainer, LightningModule
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
 import torch
 import logging
+from pathlib import Path
+
 
 early_stopping_callbacks = EarlyStopping(
     monitor="val_loss", 
@@ -13,20 +16,45 @@ early_stopping_callbacks = EarlyStopping(
     mode="min")
 
 
+# def get_checkpoint_callback(experiment_dir: str, save_ckpt_every_n_epochs: int):
+    
+#     checkpoint_dir = os.path.join(experiment_dir, 'checkpoints')
+#     os.makedirs(checkpoint_dir, exist_ok=True)
+    
+#     checkpoint_callback = ModelCheckpoint(
+#         every_n_epochs=save_ckpt_every_n_epochs, 
+#         save_top_k=-1,
+#         dirpath = checkpoint_dir,
+#         filename = "{epoch}-{train_loss:.2f}",
+#         monitor = "val_loss",
+#         mode = "min")
+    
+#     return checkpoint_callback
+
 def get_checkpoint_callback(experiment_dir: str, save_ckpt_every_n_epochs: int):
-    
-    checkpoint_dir = os.path.join(experiment_dir, 'checkpoints')
+
+    checkpoint_dir = join(experiment_dir, 'checkpoints')
     os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    checkpoint_callback = ModelCheckpoint(
-        every_n_epochs=save_ckpt_every_n_epochs, 
-        save_top_k=-1,
-        dirpath = checkpoint_dir,
-        filename = "{epoch}-{train_loss:.2f}",
-        monitor = "val_loss",
-        mode = "min")
-    
-    return checkpoint_callback
+
+    # ── 1. periodic checkpoints ────────────────────────────────────────────────
+    periodic_ckpt = ModelCheckpoint(
+        dirpath     = checkpoint_dir,
+        filename    = "{epoch}-{train_loss:.2f}",
+        every_n_epochs = save_ckpt_every_n_epochs,  # unchanged
+        save_top_k = -1,
+        monitor    = "val_loss",
+        mode       = "min",
+    )
+
+    # ── 2. one-off checkpoint right at the start ──────────────────────────────
+    class SaveInitial(Callback):
+        """Dump weights before the first optimization step."""
+        @rank_zero_only             # avoid DDP duplicates
+        def on_fit_start(self, trainer, pl_module):
+            trainer.save_checkpoint(join(checkpoint_dir, "epoch0-initial.ckpt"))
+
+    # return both callbacks so the Trainer can register them
+    return [SaveInitial(), periodic_ckpt]
 
 
 class MemoryLoggerCallback(Callback):
@@ -118,32 +146,7 @@ class GradientLogger(Callback):
                 on_epoch=True
             )
         
-        
-        
-        
-# class EmbeddingDrift(Callback):
-    
-#     def on_train_start(self, trainer, pl_module):
-#         # save the initial weight
-#         embedding = pl_module.model.enc_embedding.embed_modules_list[0].embedding.embedding.weight
-#         self.E0 = embedding.detach().clone()
 
-#     def on_train_epoch_end(self, trainer, pl_module):
-#         embedding = pl_module.model.enc_embedding.embed_modules_list[0].embedding.embedding.weight
-#         E  = embedding.detach()
-#         dF = (E - self.E0).norm() / self.E0.norm()
-#         trainer.logger.log_metrics({"emb_drift": dF.item()},
-#                                    step=trainer.current_epoch)
-        
-
-
-# class MetricsAggregator(Callback):
-#     def on_train_epoch_end(self, trainer, pl_module):
-#         trainer.logger.log_metrics(
-#             trainer.callback_metrics,          # the consolidated dict
-#             step=trainer.current_epoch
-#         )
-        
 class MetricsAggregator(Callback):
     def on_train_epoch_end(self, trainer, pl_module):
         trainer.logger.log_metrics(
