@@ -88,7 +88,7 @@ def get_df_kfold_loss(filepath: str, level_folders: List[str])->pd.DataFrame:
         "k": [],
         "val_loss": [],
         "train_loss": [],
-        # "test_loss": []
+        "test_loss": []
         }
     
     # loop over the bottom folders
