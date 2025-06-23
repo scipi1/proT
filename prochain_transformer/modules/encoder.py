@@ -44,7 +44,13 @@ class EncoderLayer(nn.Module):
         #self.time_window_offset = time_window_offset    #??
         #self.d_yc = d_yc                                # for local attention
 
-    def forward(self, X: torch.Tensor, mask_miss_k: torch.Tensor, mask_miss_q: torch.Tensor, enc_input_pos: torch.Tensor):
+    def forward(
+        self, 
+        X: torch.Tensor, 
+        mask_miss_k: torch.Tensor, 
+        mask_miss_q: torch.Tensor, 
+        enc_input_pos: torch.Tensor,
+        causal_mask: bool):
         
         # uses pre-norm Transformer architecture
         
@@ -58,7 +64,8 @@ class EncoderLayer(nn.Module):
             value=X1,
             mask_miss_k=mask_miss_k,
             mask_miss_q=mask_miss_q,
-            pos = enc_input_pos
+            pos = enc_input_pos,
+            causal_mask=causal_mask,
             )                    
         
         # resnet
@@ -94,16 +101,26 @@ class Encoder(nn.Module):
         self.norm_layer = norm_layer
         self.emb_dropout = nn.Dropout(emb_dropout)
 
-    def forward(self, X: torch.Tensor, 
-                mask_miss_k: torch.Tensor, mask_miss_q: torch.Tensor,
-                enc_input_pos: torch.Tensor):
+    def forward(
+        self, 
+        X: torch.Tensor, 
+        mask_miss_k: torch.Tensor, 
+        mask_miss_q: torch.Tensor,
+        enc_input_pos: torch.Tensor,
+        causal_mask: bool):
         
         X = self.emb_dropout(X)
 
         attn_list = []
         
         for _, encoder_layer in enumerate(self.layers):
-            X, attn = encoder_layer(X=X, mask_miss_k=mask_miss_k, mask_miss_q=mask_miss_q, enc_input_pos=enc_input_pos)            
+            X, attn = encoder_layer(
+                X=X, 
+                mask_miss_k=mask_miss_k, 
+                mask_miss_q=mask_miss_q, 
+                enc_input_pos=enc_input_pos,
+                causal_mask=causal_mask) 
+            
             attn_list.append(attn)
             
         if self.norm_layer is not None:

@@ -13,7 +13,7 @@ sys.path.append(dirname(abspath(__file__)))
 from modules.extra_layers import Normalization
 from modules.encoder import Encoder, EncoderLayer
 from modules.decoder import Decoder, DecoderLayer
-from modules.attention import ScaledDotAttention,KernelAttention,AttentionLayer
+from modules.attention import ScaledDotAttention,AttentionLayer
     
 from modules.embedding import ModularEmbedding
 from modules.extra_layers import UniformAttentionMask
@@ -41,6 +41,7 @@ class Spacetimeformer(nn.Module):
         dec_cross_attention_type,
         dec_cross_mask_type,
         n_heads: int,
+        causal_mask: bool,
         #attn_factor: int = 5, #TODO understand, DO NOT DEL for now!
         
         
@@ -118,7 +119,8 @@ class Spacetimeformer(nn.Module):
             "attention_dropout" : dec_cross_attention_dropout,
         }
         
-
+        self.causal_mask = causal_mask
+        
         self.encoder = Encoder(
             encoder_layers=[
                 EncoderLayer(
@@ -175,17 +177,16 @@ class Spacetimeformer(nn.Module):
         enc_input_pos = self.enc_embedding.pass_var(X=input_tensor) #TODO still relevant?
         enc_mask = self.enc_embedding.get_mask(X=input_tensor)
         
-        # scale embedding with missing data
-        # scale = enc_mask.shape[1]/torch.sum(~enc_mask.squeeze(),axis=-1, keepdim=True)
-        # enc_input *= scale.unsqueeze(-1)
-        # enc_input*= ~enc_mask
+        if enc_input_pos is None and self.causal_mask == True:
+            warnings.warn(f"causal_mask set to {self.causal_mask} but encoder got null input positions")
         
         # pass embedded input to encoder
-        enc_out, enc_self_attns = self.encoder(
+        enc_out, enc_self_att = self.encoder(
             X=enc_input,
             mask_miss_k=enc_mask,
             mask_miss_q=enc_mask,
-            enc_input_pos=enc_input_pos
+            enc_input_pos=enc_input_pos,
+            causal_mask=self.causal_mask
             )
         
         # embed target
@@ -193,23 +194,27 @@ class Spacetimeformer(nn.Module):
         dec_input_pos = self.dec_embedding.pass_var(X=target_tensor)
         dec_self_mask=self.dec_embedding.get_mask(X=target_tensor)
         
+        if dec_input_pos is None and self.causal_mask == True:
+            warnings.warn(f"causal_mask set to {self.causal_mask} but decoder got null input positions")
         
         # pass embedded target and encoder output to decoder
-        dec_out, dec_cross_attns = self.decoder(
+        dec_out, dec_self_att, dec_cross_att = self.decoder(
             X=dec_input,
             enc_out=enc_out,
             self_mask_miss_k=dec_self_mask, 
             self_mask_miss_q=dec_self_mask,
             cross_mask_miss_k=enc_mask, 
             cross_mask_miss_q=dec_self_mask,
-            dec_input_pos = dec_input_pos
+            dec_input_pos = dec_input_pos,
+            causal_mask=self.causal_mask
             )
+        
         # forecasting predictions
         forecast_out = self.forecaster(dec_out)
         # reconstruction predictions
         recon_out = self.reconstructor(enc_out)
         
-        return forecast_out, recon_out, (enc_self_attns, dec_cross_attns), enc_mask #TODO maybe add dec_self_att to be fair
+        return forecast_out, recon_out, (enc_self_att, dec_self_att, dec_cross_att), enc_mask
     
     
     def _attn(
@@ -227,9 +232,6 @@ class Spacetimeformer(nn.Module):
 
         # choose attention type
         assert attention_type in ["Kernel","ScaledDotProduct"]
-        
-        if attention_type == "Kernel":
-            attention_module = KernelAttention
             
         if attention_type == "ScaledDotProduct":
             attention_module = ScaledDotAttention

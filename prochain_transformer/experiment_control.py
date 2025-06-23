@@ -318,31 +318,36 @@ def update_config(config: dict)->dict:
     if config.model.comps_embed_enc == "summation":
         
         config.model.d_model_enc = config.model.d_model_set
-        config.model.enc_val_emb_hidden = config.model.d_model_set
-        config.model.enc_pos_emb_hidden = config.model.d_model_set
-        config.model.enc_var_emb_hidden = config.model.d_model_set
-        config.model.enc_time_emb_hidden = config.model.d_model_set
+        
+    #     config.model.d_model_enc = config.model.d_model_set
+    #     config.model.enc_val_emb_hidden = config.model.d_model_set
+    #     config.model.enc_pos_emb_hidden = config.model.d_model_set
+    #     config.model.enc_var_emb_hidden = config.model.d_model_set
+    #     config.model.enc_time_emb_hidden = config.model.d_model_set
             
-    if config.model.comps_embed_dec == "summation":    
+    if config.model.comps_embed_dec == "summation":
         
         config.model.d_model_dec = config.model.d_model_set
-        config.model.dec_val_emb_hidden = config.model.d_model_set
-        config.model.dec_pos_emb_hidden = config.model.d_model_set
-        config.model.dec_var_emb_hidden = config.model.d_model_set
-        config.model.dec_time_emb_hidden = config.model.d_model_set
-    
+        
+        
+    #     config.model.d_model_dec = config.model.d_model_set
+    #     config.model.dec_val_emb_hidden = config.model.d_model_set
+    #     config.model.dec_pos_emb_hidden = config.model.d_model_set
+    #     config.model.dec_var_emb_hidden = config.model.d_model_set
+    #     config.model.dec_time_emb_hidden = config.model.d_model_set
+    # TODO maybe add assertion for checking embedding dimensions
     
     if config.model.comps_embed_enc == "spatiotemporal":
         if config.model.d_model_enc == None:
             config.model.d_model_enc = config.model.d_model_set
-            config.model.enc_pos_emb_hidden = config.model.d_model_set
-            config.model.enc_var_emb_hidden = config.model.d_model_set
+            # config.model.enc_pos_emb_hidden = config.model.d_model_set
+            # config.model.enc_var_emb_hidden = config.model.d_model_set
     
     if config.model.comps_embed_dec == "spatiotemporal":    
         if config.model.d_model_dec == None:
             config.model.d_model_dec = config.model.d_model_set
-            config.model.dec_pos_emb_hidden = config.model.d_model_set
-            config.model.dec_var_emb_hidden = config.model.d_model_set
+            # config.model.dec_pos_emb_hidden = config.model.d_model_set
+            # config.model.dec_var_emb_hidden = config.model.d_model_set
     
     if config.training.optimization in [3,4,5,6,7]:
         config.model.ds_embed_enc.set.sparse_grad = True

@@ -26,6 +26,7 @@ class ScaledDotAttention(nn.Module):
         mask_miss_k: torch.Tensor,
         mask_miss_q: torch.Tensor,
         pos: torch.Tensor,
+        causal_mask: bool,
         ):
         
         #B,L,H,E = query.shape
@@ -42,10 +43,16 @@ class ScaledDotAttention(nn.Module):
         #     Attention with Linear Bias for positions
         #     (reference https://arxiv.org/abs/2108.12409)
         #     """
+        #     pos = pos.expand(B,L,L).transpose(-1,-2)-pos.expand(B,L,L)
         #     m = .5
         #     scores += m*pos.nan_to_num()
         
+        # causal mask
+        if pos is not None and causal_mask:
+            M_causal = build_causal_mask(pos)
+            scores = scores + M_causal
         
+        # missing data
         if mask_miss_k is not None:
             """
             masking missing value with -inf to force the softmax to zero
@@ -62,56 +69,72 @@ class ScaledDotAttention(nn.Module):
         else:
             att = torch.softmax(scale * scores, dim=-1)
             
-        
         A = torch.nan_to_num(self.dropout(att))
-        
         V = torch.einsum("bsl,bld->bsd", A, value)
         
-        
-        return (V.contiguous(), A)
+        return (V.contiguous(), A) #A
 
 
+def build_causal_mask(p: torch.Tensor) -> torch.Tensor:
+    """
+    Args:
+        p: (B, L, 1) tensor with the position of every token in the sequence.
+
+    Returns:
+        (B, L, L) mask M with
+            M[b, i, j] = -inf if p[b, j] > p[b, i]
+                        0    otherwise.
+    """
+    p_flat = p.squeeze(-1)      # shape (B, L)
+
+    p_i = p_flat.unsqueeze(-1)  # shape (B, L, 1)
+    p_j = p_flat.unsqueeze(-2)  # shape (B, 1, L)
+
+    # Build the additive mask (same dtype/device as `p`)
+    M = torch.zeros_like(p_i.expand(-1, -1, p_flat.size(-1)))
+    M.masked_fill_(p_j > p_i, float("-inf"))
+    return M
 
 def k_exp(Q,K,d_k):
     return torch.exp(torch.einsum("blhe,bkhe->bhlk", Q, K)/sqrt(d_k))
 
-
-class KernelAttention(nn.Module):
-    def __init__(self, mask_layer: nn.Module=None, attention_dropout: float=0) -> None:
+# TODO delete
+# class KernelAttention(nn.Module):
+#     def __init__(self, mask_layer: nn.Module=None, attention_dropout: float=0) -> None:
         
-        super(KernelAttention, self).__init__()
+#         super(KernelAttention, self).__init__()
         
-        self.mask_layer = mask_layer
-        self.dropout = nn.Dropout(attention_dropout)
-        self.kernel = self.k_exp 
+#         self.mask_layer = mask_layer
+#         self.dropout = nn.Dropout(attention_dropout)
+#         self.kernel = self.k_exp 
         
-    def k_exp(self,Q,K,d_k):
-        return torch.exp(torch.einsum("ble,bke->blk", Q, K)/sqrt(d_k))
+#     def k_exp(self,Q,K,d_k):
+#         return torch.exp(torch.einsum("ble,bke->blk", Q, K)/sqrt(d_k))
         
-    def forward(
-        self, 
-        query:torch.Tensor, 
-        key:torch.Tensor, 
-        value:torch.Tensor, 
-        mask=None,
-        output_att:bool=False):
+#     def forward(
+#         self, 
+#         query:torch.Tensor, 
+#         key:torch.Tensor, 
+#         value:torch.Tensor, 
+#         mask=None,
+#         output_att:bool=False):
         
-        B,L,E = query.shape
-        _,K,_ = key.shape
-        _,S,D = value.shape
+#         B,L,E = query.shape
+#         _,K,_ = key.shape
+#         _,S,D = value.shape
         
-        ker = self.dropout(self.kernel(query,key,E))
+#         ker = self.dropout(self.kernel(query,key,E))
         
-        # normalization constant
-        Z = ker.sum(axis=2).unsqueeze(-1).expand(-1,-1,K)
+#         # normalization constant
+#         Z = ker.sum(axis=2).unsqueeze(-1).expand(-1,-1,K)
         
-        attention_scores = ker/Z
+#         attention_scores = ker/Z
         
-        # masking
-        if self.mask_layer is not None and mask is not None:
-            attention_scores = self.mask_layer(attention_scores, mask)
+#         # masking
+#         if self.mask_layer is not None and mask is not None:
+#             attention_scores = self.mask_layer(attention_scores, mask)
         
-        return (attention_scores@value, attention_scores)
+#         return (attention_scores@value, attention_scores)
         
         
 class AttentionLayer(nn.Module):
@@ -147,16 +170,17 @@ class AttentionLayer(nn.Module):
         value: torch.Tensor,
         mask_miss_k: torch.Tensor,
         mask_miss_q: torch.Tensor,
-        pos: torch.Tensor
+        pos: torch.Tensor,
+        causal_mask: bool,
         ):
         
         B, L, _ = query.shape
         _, S, _ = key.shape
         H = self.n_heads
         
-        
-        if pos is not None:
-            pos = pos.expand(B,L,L).transpose(-1,-2)-pos.expand(B,L,L)
+        # Move it eventually somewhere else
+        # if pos is not None:
+        #     pos = pos.expand(B,L,L).transpose(-1,-2)-pos.expand(B,L,L)
             
         
         
@@ -175,7 +199,8 @@ class AttentionLayer(nn.Module):
             value=value,
             mask_miss_k=mask_miss_k,
             mask_miss_q=mask_miss_q,
-            pos = pos
+            pos=pos,
+            causal_mask=causal_mask,
             )
         
         out = out.view(B, L, -1)

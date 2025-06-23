@@ -59,8 +59,8 @@ def train(exp_id, debug, cluster, scratch_path, resume_checkpoint, plot_pred_che
     
     
     
-    # @combination_sweep(exp_dir, mode=sweep_mode)
-    @independent_sweep(exp_dir)
+    @combination_sweep(exp_dir, mode=sweep_mode)
+    #@independent_sweep(exp_dir)
     def run_sweep(config,save_dir):
         kfold_train(
             config = config, 

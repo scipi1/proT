@@ -81,7 +81,7 @@ class ModularEmbedding(nn.Module):
         self.mask_idx = None
         self.val_idx = None
         
-        # unpack settings
+        # unpack settings for spatiotemporal
         d_model = ds_embed["set"]["d_model"]
         d_time = ds_embed["set"]["d_time"]
         d_val = ds_embed["set"]["d_value"]
@@ -130,7 +130,7 @@ class ModularEmbedding(nn.Module):
                 
                 if self.pass_idx_list is None:
                     self.pass_idx_list = []
-                    
+                
                 self.pass_idx_list.append(idx_)
                 
                 
@@ -183,7 +183,7 @@ class ModularEmbedding(nn.Module):
         out tensor shape (BS, seq_length, d_model)   
         """ 
         
-        return torch.sum(torch.concat([embed(X).unsqueeze(-1) for embed in self.embed_list],dim=-1),dim=-1)
+        return torch.sum(torch.concat([embed(X).unsqueeze(-1) for embed in self.embed_list if embed(X).shape[-1]!=0],dim=-1),dim=-1)
     
     
     
@@ -219,11 +219,14 @@ class ModularEmbedding(nn.Module):
         time = torch.nan_to_num(X_emb[time_idx])
         val = torch.nan_to_num(X_emb[val_idx])
         var = torch.nan_to_num(X_emb[var_idx])
-        
         time_val = torch.cat([time, val], dim=-1)
         time_val_emb = self.W_time_val(time_val)
         
-        return time_val_emb + pos + var
+        # for ablation
+        res = time_val_emb + pos if pos.shape[-1]!=0 else time_val_emb
+        res = time_val_emb + var if var.shape[-1]!=0 else res
+        
+        return res
     
     
     def get_mask_tensor(self, X: torch.Tensor)->torch.Tensor:

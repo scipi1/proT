@@ -42,8 +42,7 @@ class DecoderLayer(nn.Module):
         d_ff,
         dropout_ff,
         dropout_attn_out,
-        
-    ):
+        ):
         super(DecoderLayer, self).__init__()
         
         # global attention is initialized in the `model.py` module
@@ -70,34 +69,40 @@ class DecoderLayer(nn.Module):
     def forward(
         self, X: torch.Tensor, 
         enc_out: torch.Tensor, 
-        self_mask_miss_k: torch.Tensor, self_mask_miss_q: torch.Tensor,
-        cross_mask_miss_k: torch.Tensor, cross_mask_miss_q: torch.Tensor,
-        dec_input_pos: torch.Tensor):
-        
+        self_mask_miss_k: torch.Tensor, 
+        self_mask_miss_q: torch.Tensor,
+        cross_mask_miss_k: torch.Tensor, 
+        cross_mask_miss_q: torch.Tensor,
+        dec_input_pos: torch.Tensor,
+        causal_mask: bool
+        ):
         
         X1 = self.norm1(X, ~self_mask_miss_q)
         
-        X1, _ = self.global_self_attention(
+        X1, dec_self_att = self.global_self_attention(
             query=X1,
             key=X1,
             value=X1,
             mask_miss_k=self_mask_miss_k,
             mask_miss_q=self_mask_miss_q,
-            pos=dec_input_pos
+            pos=dec_input_pos,
+            causal_mask=causal_mask
             )
         
         X = X + self.dropout_attn_out(X1)
         
         X1 = self.norm2(X, ~self_mask_miss_q)
         
-        X1, attn = self.global_cross_attention(
+        X1, dec_cross_att = self.global_cross_attention(
             query=X1,
             key=enc_out,
             value=enc_out,
             mask_miss_k=cross_mask_miss_k,
             mask_miss_q=cross_mask_miss_q,
-            pos = None
-        )
+            pos = None,
+            causal_mask = False
+            )
+        
         X = X + self.dropout_attn_out(X1)
 
         X1 = self.norm3(X, ~self_mask_miss_q)
@@ -114,7 +119,7 @@ class DecoderLayer(nn.Module):
         # final res connection
         decoder_out = X + X1
 
-        return decoder_out, attn
+        return decoder_out, dec_self_att, dec_cross_att
     
     
 class Decoder(nn.Module):
@@ -130,29 +135,38 @@ class Decoder(nn.Module):
         self.emb_dropout = nn.Dropout(emb_dropout)
 
     def forward(
-        self, X: torch.Tensor, enc_out: torch.Tensor, 
-        self_mask_miss_k: torch.Tensor, self_mask_miss_q: torch.Tensor,
-        cross_mask_miss_k: torch.Tensor, cross_mask_miss_q: torch.Tensor,
-        dec_input_pos: torch.Tensor):
+        self, X: torch.Tensor, 
+        enc_out: torch.Tensor, 
+        self_mask_miss_k: torch.Tensor, 
+        self_mask_miss_q: torch.Tensor,
+        cross_mask_miss_k: torch.Tensor, 
+        cross_mask_miss_q: torch.Tensor,
+        dec_input_pos: torch.Tensor,
+        causal_mask: bool
+        ):
         
         X = self.emb_dropout(X)
 
-        attn_list = []
+        dec_self_att_list = []
+        dec_cross_att_list = []
         
         for _, decoder_layer in enumerate(self.layers):
             
-            X, attn, = decoder_layer(
+            X, dec_self_att, dec_cross_att = decoder_layer(
                 X=X, 
                 enc_out=enc_out, 
                 self_mask_miss_k=self_mask_miss_k, 
                 self_mask_miss_q=self_mask_miss_q,
                 cross_mask_miss_k=cross_mask_miss_k, 
                 cross_mask_miss_q=cross_mask_miss_q,
-                dec_input_pos=dec_input_pos)
+                dec_input_pos=dec_input_pos,
+                causal_mask=causal_mask
+                )
             
-            attn_list.append(attn)
+            dec_self_att_list.append(dec_self_att)
+            dec_cross_att_list.append(dec_cross_att)
 
         if self.norm_layer is not None:
             X = self.norm_layer(X, ~self_mask_miss_q)
 
-        return X, attn_list
+        return X, dec_self_att_list, dec_cross_att_list

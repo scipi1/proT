@@ -45,6 +45,7 @@ class TransformerForecaster(pl.LightningModule):
             dec_self_mask_type =       config["model"]["dec_self_mask_type"],
             dec_cross_mask_type =      config["model"]["dec_cross_mask_type"],
             n_heads =                  config["model"]["n_heads"],
+            causal_mask =              config["model"]["causal_mask"],
             #attn_factor: int = 5, #TODO understand, DO NOT DEL for now!
             
             # options
@@ -100,13 +101,13 @@ class TransformerForecaster(pl.LightningModule):
         dec_input = data_trg.clone()
         dec_input[:, :, self.val_idx] = 0
         
-        forecast_output, recon_output, (enc_self_attns, dec_cross_attns), enc_mask = self.model.forward(
+        forecast_output, recon_output, (enc_self_att, dec_self_att, dec_cross_att), enc_mask = self.model.forward(
             input_tensor=encoder_in,
             target_tensor=dec_input)
             #**self.dynamic_kwargs)
         
         
-        return forecast_output, recon_output, (enc_self_attns, dec_cross_attns), enc_mask
+        return forecast_output, recon_output, (enc_self_att, dec_self_att, dec_cross_att), enc_mask
     
     def set_kwargs(self, kwargs):
         self.dynamic_kwargs = kwargs

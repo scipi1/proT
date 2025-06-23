@@ -21,18 +21,25 @@ class Time2Vec(nn.Module):
 
     def forward(self, x: torch.Tensor):
         if self.embed_dim == 0:
+            # for ablation study
             return torch.empty((x.shape[0], x.shape[1],0), device=x.get_device())
         
         else:
-            x = torch.nan_to_num(x)
+            x = torch.nan_to_num(x) # shape: (B, L, input_dim)
 
-            x_diag = torch.diag_embed(x).clone().detach()#, dtype=self.embed_weight.dtype)
-            """x.shape = (bs, sequence_length, input_dim, input_dim)"""
-            x_affine = torch.matmul(x_diag, self.embed_weight) + self.embed_bias
-            """x_affine.shape = (bs, sequence_length, input_dim, time_embed_dim)"""
-            x_affine_0, x_affine_remain = torch.split(x_affine, [1, self.embed_dim - 1], dim=-1)
+            x_diag = torch.diag_embed(x).clone().detach()
+            x_affine = torch.matmul(x_diag, self.embed_weight) + self.embed_bias # shape: (B, L, input_dim, embed_dim)
+            
+            # separate the first dimension (no activation applied)
+            x_affine_0, x_affine_remain = torch.split(x_affine, [1, self.embed_dim - 1], dim=-1) # shapes: (B, L, 1) and (B, L, emb_dim-1)
+            
+            # apply activation on the remaining dimensions
             x_affine_remain = self.activation(x_affine_remain)
+            
+            # join again the zero and activated dimensions
             x_out = torch.cat([x_affine_0, x_affine_remain], dim=-1)
+            
+            # different time components are concatenated
             x_out = x_out.view(x_out.size(0), x_out.size(1), -1)
             return x_out
 
