@@ -7,6 +7,7 @@ import sys
 from os.path import abspath, join, exists, dirname
 sys.path.append(dirname(dirname(abspath(__file__))))
 from prochain_transformer.kfold_train import kfold_train
+from prochain_transformer.global_trainer import global_kfold_train
 from prochain_transformer.experiment_control import combination_sweep, independent_sweep
 from prochain_transformer.predict import predict_test_from_ckpt
 from prochain_transformer.modules.utils import mk_fname, find_last_checkpoint
@@ -73,8 +74,70 @@ def train(exp_id, debug, cluster, scratch_path, resume_checkpoint, plot_pred_che
     
     run_sweep()
     
+
+
+
+#____________________________________________________________________________________________________________________________________
+    
+@click.command()
+@click.option("--exp_id", help="Experiment folder containing the config file")
+@click.option("--debug", default=False, help="Debug mode")
+@click.option("--cluster", default=False, help="On the cluster?")
+@click.option("--scratch_path", default=None, help="SCRATCH path")
+@click.option("--resume_checkpoint", default=None, help="Resume training from checkpoint")
+@click.option("--plot_pred_check", default=True, help="Set to True for a quick prediction plot after training")
+@click.option("--sweep_mode", default="combination", help= "sweep mode, either 'independent' or 'combination'")
+def global_train(exp_id, debug, cluster, scratch_path, resume_checkpoint, plot_pred_check,  sweep_mode:str):
+    
+    # Get folders
+    ROOT_DIR = dirname(dirname(abspath(__file__)))
+    
+    print(exp_id)
+    print(scratch_path)
     
     
+    # directory pointer for cluster
+    if scratch_path is None:
+        exp_dir = join(ROOT_DIR, "experiments/training", exp_id)
+    else:
+        exp_dir = join(scratch_path)
+        
+    data_dir = join(ROOT_DIR, "data/input/")
+    
+    # Create loggers
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    logger_info = logging.getLogger("logger_info")
+    info_handler = logging.FileHandler(join(ROOT_DIR,  mk_fname(filename="log", label="train", suffix="log")))
+    logger_info.setLevel(logging.INFO)
+    info_handler.setFormatter(formatter)
+    logger_info.addHandler(info_handler)
+    
+    if debug:
+        # memory logger
+        logger_memory = logging.getLogger("logger_memory")
+        memory_handler = logging.FileHandler(join(ROOT_DIR, mk_fname(filename="log", label="memory", suffix="log")))
+        logger_memory.setLevel(logging.INFO)
+        memory_handler.setFormatter(formatter)
+        logger_memory.addHandler(memory_handler)
+    
+    
+    
+    @combination_sweep(exp_dir, mode=sweep_mode)
+    #@independent_sweep(exp_dir)
+    def run_sweep(config,save_dir):
+        global_kfold_train(
+            config = config,
+            data_dir = data_dir, 
+            save_dir = save_dir, 
+            cluster = cluster, 
+            resume_ckpt = resume_checkpoint,
+            plot_pred_check = plot_pred_check,
+            debug = debug)
+    
+    run_sweep()
+    
+    
+#____________________________________________________________________________________________________________________________________
     
 @click.command()
 @click.option("--exp_id", default=None, help="Relative path to experiment from experiment/training")

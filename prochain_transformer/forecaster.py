@@ -118,7 +118,6 @@ class TransformerForecaster(pl.LightningModule):
         
         
         predict_out,_,_, enc_mask = self.forward(data_input=X, data_trg=Y, kwargs=self.dynamic_kwargs)
-        
         trg = torch.nan_to_num(Y[:,:,self.val_idx])
                 
         mse_per_elem  = self.loss_fn(predict_out.squeeze(), trg.squeeze())

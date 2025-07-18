@@ -24,12 +24,13 @@ class EmbeddingMap(nn.Module):
         
         # before every embedding, nan values are replaced by 0
         X_ = torch.nan_to_num(X[:,:,self.var_idx])
+        # out = self.embedding(X_)
         
         try:
             out = self.embedding(X_)
         except:
             # in case the embedding is a lookup table, the input must be int
-            X_ = X_.type(torch.int)
+            X_ = X_.to(torch.long)
             out = self.embedding(X_)
             
         return out
@@ -82,14 +83,14 @@ class ModularEmbedding(nn.Module):
         self.val_idx = None
         
         # unpack settings for spatiotemporal
-        d_model = ds_embed["set"]["d_model"]
-        d_time = ds_embed["set"]["d_time"]
-        d_val = ds_embed["set"]["d_value"]
+        d_model = ds_embed["setting"]["d_model"] if comps == "spatiotemporal" else None
+        d_time = ds_embed["setting"]["d_time"]  if comps == "spatiotemporal" else None
+        d_val = ds_embed["setting"]["d_value"]  if comps == "spatiotemporal" else None
         
         if comps == "spatiotemporal":
             self.W_time_val = nn.Linear(d_time+d_val, d_model, bias=True)
         
-        for var in ds_embed["def"]:
+        for var in ds_embed["modules"]:
             
             idx_, embed_, label_ ,kwargs = var["idx"], var["embed"], var["label"], var["kwargs"]
             
@@ -114,7 +115,6 @@ class ModularEmbedding(nn.Module):
                 
             if embed_ == "linear":
                 emb_module = linear_emb
-            
             
             # store value index
             if embed_ == "value":

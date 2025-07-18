@@ -9,8 +9,9 @@ import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
 import torch
 from prochain_transformer.dataloader import ProcessDataModule
-from callbacks import early_stopping_callbacks, get_checkpoint_callback, MemoryLoggerCallback, GradientLogger, LayerRowStats, MetricsAggregator
+from callbacks import early_stopping_callbacks, get_checkpoint_callback, MemoryLoggerCallback, GradientLogger, LayerRowStats, MetricsAggregator, PerRunManifest
 from forecaster import TransformerForecaster
+from prochain_transformer.baseline.baseline_pl_modules import RNNForecaster
 from labels import *
 from subroutines.sub_utils import mk_missing_folders
 from pytorch_lightning import seed_everything
@@ -23,11 +24,12 @@ from pytorch_lightning.callbacks import LearningRateMonitor
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 
-def kfold_train(
-    config: dict, 
-    data_dir: str, 
+def global_kfold_train(
+    config: dict,
+    data_dir: str,
     save_dir: str,
-    cluster: bool, 
+    cluster: bool,
+    experiment_tag: str="NA",
     resume_ckpt: str=None,
     plot_pred_check: bool=False,
     debug: bool=False,
@@ -51,6 +53,10 @@ def kfold_train(
     seed = config["training"]["seed"]
     seed_everything(seed)
     torch.set_float32_matmul_precision("high")
+    
+    # get model object from configuration (version 4.6.0 or higher)
+    model_object = get_model_object(config)
+    
     
     dm = ProcessDataModule(
         data_dir = join(data_dir,config["data"]["dataset"]),
@@ -90,7 +96,7 @@ def kfold_train(
     for fold, (train_local_idx, val_local_idx) in enumerate(kfold.split(train_val_idx)):
         
         # re-initialize the model at any fold
-        model = TransformerForecaster(config)
+        model = model_object(config)
         
         print(f"Fold {fold + 1}/{k_folds}")
         logger_info.info(f"Fold {fold + 1}/{k_folds}")
@@ -104,19 +110,19 @@ def kfold_train(
         logger = TensorBoardLogger(save_dir=logs_dir, name="tensorboard")
         logger_csv = CSVLogger(save_dir=logs_dir, name="csv")
         checkpoint_callback = get_checkpoint_callback(save_dir_k,config["training"]["save_ckpt_every_n_epochs"])        
+        manifest_callback  = PerRunManifest(config, path=save_dir_k, tag=experiment_tag)
         
+        callbacks_list = [cb for cb in checkpoint_callback]
+        callbacks_list.append(manifest_callback)
         
-        callbacks_list = [
-            #early_stopping_callbacks, 
-            cb for cb in checkpoint_callback
-            ]
+        if "early_stopping" in config["special"]["mode"]:
+            callbacks_list.append(early_stopping_callbacks)
         
         
         if debug:
             callbacks_list.append(MemoryLoggerCallback())
-            
-            
-        if config["special"]["mode"] == "debug_optimizer":
+        
+        if "debug_optimizer" in config["special"]["mode"]:
             callbacks_list.append(GradientLogger())
             callbacks_list.append(LayerRowStats(layer_name="encoder_variable"))
             callbacks_list.append(LayerRowStats(layer_name="encoder_position"))
@@ -158,6 +164,27 @@ def kfold_train(
 
 
 
+
+def get_model_object(config: dict)->pl.LightningModule:
+    
+    model_obj = config["model"]["model_object"]
+    available_models = ["proT","LSTM","GRU", "TCN"]
+    
+    assert model_obj in available_models, AssertionError(f"{model_obj} unavailable! Choose between {available_models}")
+
+    MODEL_REGISTRY = {
+    "proT": TransformerForecaster,
+    "GRU" : RNNForecaster,
+    "LSTM": RNNForecaster,
+    "TCN": RNNForecaster,
+    }
+    return MODEL_REGISTRY[model_obj]
+
+
+
+
+
+
 if __name__ == "__main__":
     
     """
@@ -165,21 +192,20 @@ if __name__ == "__main__":
     """
     
     ROOT_DIR = dirname(dirname(abspath(__file__)))
-    exp_dir = join(ROOT_DIR, "experiments/training/test/")
+    exp_dir = join(ROOT_DIR, "experiments/training/test_TCN_dyconex")
     data_dir = join(ROOT_DIR, "data/input/")
     
-    
-    config = OmegaConf.load(join(exp_dir,"config.yaml"))
+    config = OmegaConf.load(join(exp_dir,"config_TCN_v1-0-0_dyconex.yaml"))
     config_updated = update_config(config)
-    
-    
+        
     save_dir = exp_dir
     
-    kfold_train(
-        config = config_updated, 
+    global_kfold_train(
+        config = config_updated,
         data_dir = data_dir, 
-        save_dir = save_dir, 
+        save_dir = save_dir,
+        experiment_tag = "test", 
         cluster = False, 
         resume_ckpt = None,
-        plot_pred_check = True,
+        plot_pred_check = False,
         debug = True)

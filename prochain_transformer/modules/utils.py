@@ -1,11 +1,15 @@
 import torch
 import logging
 import os
+from os.path import dirname, abspath
 from datetime import datetime
 from pytorch_lightning import seed_everything
 import glob
 import re
-import os
+import sys
+ROOT_DIR = dirname(dirname(dirname(abspath(__file__))))
+sys.path.append(ROOT_DIR)
+
 
 def set_seed(seed=42):
     """

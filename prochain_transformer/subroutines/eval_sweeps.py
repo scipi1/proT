@@ -46,12 +46,11 @@ def get_df_recursive(filepath: str, bottom_action: Callable, is_bottom: Callable
     """
     Loops recursively inside folders, keeping track of the various levels, until the bottom is reached
     At the bottom, performs the bottom_action.
-    
-    N.B. The condition for the bottom is hard-coded
 
     Args:
         filepath (str): level path, if user input, starting level
         bottom_action (Callable): function to perform at the bottom level
+        is_bottom (Callable): function to check if a given layer is the bottom one
         s3 (bool): AWS s3 flag
         lev (int, optional): Current level, leave default value. Defaults to 0.
 

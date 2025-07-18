@@ -72,7 +72,7 @@ class ScaledDotAttention(nn.Module):
         A = torch.nan_to_num(self.dropout(att))
         V = torch.einsum("bsl,bld->bsd", A, value)
         
-        return (V.contiguous(), A) #A
+        return (V.contiguous(), A)
 
 
 def build_causal_mask(p: torch.Tensor) -> torch.Tensor:

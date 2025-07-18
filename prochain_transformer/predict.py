@@ -11,6 +11,7 @@ from pathlib import Path
 from omegaconf import OmegaConf
 import pytorch_lightning as pl
 from tqdm import tqdm
+import yaml
 
 root_path = dirname(dirname(abspath(__file__)))
 import sys
@@ -26,7 +27,7 @@ def predict(
     model: pl.LightningModule,
     dm: pl.LightningDataModule,
     dataset_label: str,
-    input_mask: torch.Tensor=None,
+    # input_mask: torch.Tensor=None, # TODO: delete
     debug_flag: bool=False,
     kwargs=None)-> Tuple[np.ndarray, np.ndarray, np.ndarray, list]:
     """
@@ -49,7 +50,7 @@ def predict(
                 ]: input_array, output_array, target_array, cross_att_array
     """
     
-    assert dataset_label in ["train","test","val"], AssertionError("Invalid dataset label!")
+    assert dataset_label in ["train","test", "all"], AssertionError("Invalid dataset label!")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -67,9 +68,14 @@ def predict(
     if dataset_label == "train":
         dataset = dm.train_dataloader()
         print("Train dataset selected.")
-    else:
+        
+    elif dataset_label == "test":
         dataset = dm.test_dataloader()
         print("Test dataset selected (default).")
+        
+    elif dataset_label == "all":
+        dataset = dm.all_dataloader()
+        print("All data selected (default).")
         
     # loop over prediction batches
     print("Predicting...")
@@ -82,21 +88,6 @@ def predict(
 
         X,trg = batch
         
-        # TODO delete
-        # # mask the input for GSA
-        # if input_mask is not None:
-        #     binary_mask = input_mask.float()
-            
-        #     if X.dim() == 3:
-        #         M = binary_mask.view(1,1,binary_mask.size(0))
-        #     elif X.dim() == 2:
-        #         M = binary_mask.view(1,binary_mask.size(0))
-                
-        #     M_expanded = M.expand_as(X)
-        #     M_expanded=M_expanded.to(device)
-            
-        #     X = X*M_expanded
-            
         with torch.no_grad():
             forecast_output, recon_output, (enc_self_att, dec_self_att, dec_cross_att), enc_mask = forecaster.forward(
                 data_input=X,
@@ -192,7 +183,9 @@ def mk_quick_pred_plot(model: pl.LightningModule, dm: pl.LightningDataModule, va
 def predict_test_from_ckpt(
     config: dict, 
     datadir_path: Path, 
-    checkpoint_path: Path, 
+    checkpoint_path: Path,
+    external_dataset: dict=None, #TODO: specify keys
+    dataset_label: str="test",
     cluster: bool=False
     )->Tuple[np.ndarray]:
     
@@ -211,29 +204,44 @@ def predict_test_from_ckpt(
         Tuple[np.ndarray]: input_array, output_array, target_array, cross_att_array
     """
     
+    assert dataset_label in ["train","test","all"], AssertionError(f"{dataset_label} is not a proper label!")
+    
     seed = config["training"]["seed"]
     seed_everything(seed)
     torch.set_float32_matmul_precision("high")
     
-    # get data module from config
-    dm = ProcessDataModule(
-        data_dir = join(datadir_path,config["data"]["dataset"]),
-        input_file =  config["data"]["filename_input"],
-        target_file = config["data"]["filename_target"],
-        batch_size =  config["training"]["batch_size"],
-        num_workers = 1 if cluster else 20,
-        data_format = "float32",
-        seed = seed,
-    )
+    if external_dataset is not None:
+        dm = ProcessDataModule(
+            data_dir = join(datadir_path, external_dataset["dataset"]),
+            input_file =  external_dataset["filename_input"],
+            target_file = external_dataset["filename_target"],
+            batch_size =  config["training"]["batch_size"],
+            num_workers = 1 if cluster else 20,
+            data_format = "float32",
+            seed = seed,
+            )
     
-    # get test indexes from config
-    test_ds_idx_filename = config["data"]["test_ds_ixd"]
-    assert test_ds_idx_filename is not None, AssertionError("Invalid test dataset index file")
+    else:
+        # get data module from config
+        dm = ProcessDataModule(
+            data_dir = join(datadir_path,config["data"]["dataset"]),
+            input_file =  config["data"]["filename_input"],
+            target_file = config["data"]["filename_target"],
+            batch_size =  config["training"]["batch_size"],
+            num_workers = 1 if cluster else 20,
+            data_format = "float32",
+            seed = seed,
+        )
     
-    test_idx = np.load(join(datadir_path,config["data"]["dataset"],test_ds_idx_filename))
+    if external_dataset is None:
+        # get test indexes from config
+        test_ds_idx_filename = config["data"]["test_ds_ixd"]
+        assert test_ds_idx_filename is not None, AssertionError("Invalid test dataset index file")
     
-    # update data module ds
-    dm.update_idx(train_idx=test_idx, val_idx=test_idx,test_idx=test_idx)
+        test_idx = np.load(join(datadir_path,config["data"]["dataset"],test_ds_idx_filename))
+    
+        # update data module ds
+        dm.update_idx(train_idx=test_idx, val_idx=test_idx,test_idx=test_idx)
     
     # update config
     config_updated = update_config(config)
@@ -256,12 +264,14 @@ def predict_test_from_ckpt(
     input_array, output_array, target_array, cross_att_array = predict(
         model=forecaster,
         dm=dm,
-        dataset_label = "test",
-        input_mask=None,
+        dataset_label = dataset_label,
+        #input_mask=None,
         debug_flag=False,
         kwargs=None)
     
     return input_array, output_array, target_array, cross_att_array
+
+
 
 
 
@@ -274,20 +284,7 @@ def predict_GSA_kill_feature(
     cluster: bool=False
     )->Tuple[np.ndarray]:
     
-    """
-    Runs the prediction steps according to config. In the specific:
-    1) Loads the model at a given checkpoint
-    2) Loads the dataset as specified by the config
-    3) Calls the `predict` method
-    Args:
-        config (dict): conf for model loading
-        data_dir (Path): path to data directory
-        checkpoint_path (Path): path to checkpoint
-        cluster (bool, optional): Running on the cluster? Defaults to False.
-
-    Returns:
-        Tuple[np.ndarray]: input_array, output_array, target_array, cross_att_array
-    """
+    # TODO. documentation
     
     seed = config["training"]["seed"]
     seed_everything(seed)
@@ -320,7 +317,6 @@ def predict_GSA_kill_feature(
     
     # update data module ds
     dm.update_idx(train_idx=test_idx, val_idx=test_idx,test_idx=test_idx)
-    
     
     # get unique keys of the control index
     keys = get_control_keys(
@@ -364,8 +360,6 @@ def predict_GSA_kill_feature(
         
         kill_keys_dict[key] = pred_tuple
         
-        breakpoint()
-    
     
     # TODO: save prediction on dictionary
     
@@ -378,6 +372,7 @@ def get_control_keys(
     dataset_label: str,
     control_idx: int
     ):
+    # TODO: add documentation
     
     assert dataset_label in ["train","test","val"], AssertionError("Invalid dataset label!")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -516,9 +511,88 @@ def predict_mask(
 
 
 
+# TODO. delete it
+# def get_features_gradients(
+#     config_path: Path,
+#     datadir_path: Path, 
+#     checkpoint_path: Path,
+#     features_dict: dict=None, 
+#     )->dict:
+    
+#     """
+#     Calculates the gradients of a given model output w.r.t. the input features.
+#     The model is loaded from a specified checkpoint and settings are loaded from a config file
+#     The gradients are calculated via forward and backward pass of the full input dataset
+#     Args:
+#         config_path (Path): absolute path to configuration file
+#         datadir_path (Path): absolute path to data directory
+#         checkpoint_path (Path): path to checkpoint
+#         features_dict (dict): dictionary {index: feature}, default None. 
+#                                 If None, automatically look for it 
+#     Returns:
+#         dict: sensitivities for features_dict
+#     """
+    
+#     config = OmegaConf.load(config_path) # load config
+    
+#     # settings
+#     seed = config["training"]["seed"]
+#     seed_everything(seed)
+#     torch.set_float32_matmul_precision("high")
+#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+#     data_dir = join(datadir_path,config["data"]["dataset"])
+#     input_file =  config["data"]["filename_input"]
+#     target_file = config["data"]["filename_target"]
+    
+#     # load dataset arrays
+#     X = np.load(join(data_dir, input_file), allow_pickle=True, mmap_mode='r')
+#     Y = np.load(join(data_dir, target_file), allow_pickle=True, mmap_mode='r')
+    
+#     # load tensors
+#     x_all = torch.tensor(X, dtype=torch.float32, device=device, requires_grad=True)  # full input
+#     y_all = torch.tensor(Y, dtype=torch.float32, device=device, requires_grad=False)  # full input
+    
+#     B,L,_ = x_all.shape    # batch size and seq length used for normalization
+    
+#     config_updated = update_config(config)                      # update config
+#     model = TransformerForecaster(config_updated)               # load model
+#     forecaster = model.load_from_checkpoint(checkpoint_path)    # load checkpoint
+    
+#     # Control statement to check if the model loaded correctly
+#     if forecaster is None:
+#         raise RuntimeError("Model failed to load from checkpoint.")
 
-
-
+#     # Check if model parameters are properly loaded (ensure they are not uninitialized)
+#     if not any(param.requires_grad for param in forecaster.parameters()):
+#         raise RuntimeError("Model parameters seem uninitialized. Check the checkpoint path.")
+    
+#     # set up model
+#     forecaster.to(device)
+#     forecaster.eval().requires_grad_(False)
+#     forecaster.model.zero_grad(set_to_none=True)
+    
+#     y, *_ = forecaster(    # forward pass
+#         data_input=x_all,
+#         data_trg=y_all,
+#         kwargs=None
+#         )
+#     y.sum().backward()          # backwards
+    
+#     # gradients
+#     grads = x_all.grad 
+    
+#     # features
+#     if features_dict is None:
+#         feat_dict_path = join(datadir_path,config["data"]["dataset"],"features_dict")
+#         with open(feat_dict_path, 'r') as file:
+#             features_dict = yaml.safe_load(file)
+#             input_features_dict = features_dict["input"]
+        
+#     # sensitivities
+#     S = {input_features_dict[s] : grads[:,:, int(s)].norm().item() / (B*L) for s in input_features_dict.keys()}
+    
+#     return S
 
 
 
@@ -538,3 +612,4 @@ if __name__ == "__main__":
     print(f"output shape: {output_array.shape}")
     print(f"target shape: {target_array.shape}")
     print(f"attention shape: {cross_att_array.shape}")
+

@@ -6,30 +6,85 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_only
 import torch
 import logging
 from pathlib import Path
+import json, datetime, pytorch_lightning as pl
+import time
+import sys
+ROOT_DIR = dirname(dirname(abspath(__file__)))
+sys.path.append(ROOT_DIR)
+
+
+
+class PerRunManifest(pl.Callback):
+    def __init__(self, config, path, tag=""):
+        self.config = config
+        self.tag    = tag
+        self.path   = path
+
+    # helpers
+    def _gather_common(self):
+        return {
+            "timestamp" : datetime.datetime.utcnow().isoformat(timespec="seconds")+"Z",
+            "model"     : self.config["model"]["model_object"],
+            "dataset"   : self.config["data"]["dataset"],    
+            "tag"       : self.tag,
+            "path"      : self.path
+        }
+
+    def _write_manifest(self, new_fields: dict):
+        log_dir = join(ROOT_DIR,"logs")
+        info_f  = Path(join(log_dir,"manifest.json"))
+
+        # load previous if exists
+        if info_f.exists():
+            with open(info_f) as f:
+                entry = json.load(f)
+        else:
+            entry = {}
+
+        entry.update(self._gather_common())  
+        entry.update(new_fields)                    
+
+        with open(info_f, "w") as f:
+            json.dump(entry, f, indent=2)
+    
+    def _elapsed(self):
+        return time.time() - getattr(self, "_fit_start_time", time.time())
+
+    
+    # lightning hooks
+    def on_fit_start(self,trainer, pl_module):
+        self._fit_start_time = time.time()
+    
+    def on_validation_epoch_end(self, trainer, pl_module):
+        m = trainer.logged_metrics
+        epochs_run = trainer.current_epoch
+        self._write_manifest({
+            "val_loss"      : float(m.get("val_loss", float("nan"))),
+            "val_mae"       : float(m.get("val_mae",  float("nan"))),
+            "val_r2"        : float(m.get("val_r2",   float("nan"))),
+            "val_rmse"      : float(m.get("val_rmse", float("nan"))),
+            "train_seconds" : round(self._elapsed(), 2),
+            "epochs"        : epochs_run,
+        })
+
+    def on_test_end(self, trainer, pl_module):
+        m = trainer.logged_metrics
+        self._write_manifest({
+            "test_loss" : float(m.get("test_loss", float("nan"))),
+            "test_mae"  : float(m.get("test_mae", float("nan"))),
+            "test_r2"   : float(m.get("test_r2", float("nan"))),
+            "test_rmse" : float(m.get("test_rmse", float("nan")))
+        })
 
 
 early_stopping_callbacks = EarlyStopping(
-    monitor="val_loss", 
-    min_delta=0.00, 
-    patience=100, 
-    verbose=False, 
-    mode="min")
+    monitor="val_mae", # what to watch
+    min_delta=1E-5,    # improvement threshold
+    patience=50,       # epochs to wait
+    verbose=True, 
+    mode="min"         # lower is better
+    )         
 
-
-# def get_checkpoint_callback(experiment_dir: str, save_ckpt_every_n_epochs: int):
-    
-#     checkpoint_dir = os.path.join(experiment_dir, 'checkpoints')
-#     os.makedirs(checkpoint_dir, exist_ok=True)
-    
-#     checkpoint_callback = ModelCheckpoint(
-#         every_n_epochs=save_ckpt_every_n_epochs, 
-#         save_top_k=-1,
-#         dirpath = checkpoint_dir,
-#         filename = "{epoch}-{train_loss:.2f}",
-#         monitor = "val_loss",
-#         mode = "min")
-    
-#     return checkpoint_callback
 
 def get_checkpoint_callback(experiment_dir: str, save_ckpt_every_n_epochs: int):
 

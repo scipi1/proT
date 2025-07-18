@@ -94,6 +94,7 @@ class nn_embedding(nn.Module):
         if self.embed_dim == 0:
             return torch.empty((X.shape[0], X.shape[1],0), device=X.get_device())
         else:
+            X = X.to(torch.long)
             return self.embedding(X)
 
 

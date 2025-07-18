@@ -43,6 +43,7 @@ def find_yml_files(dir:str)-> Tuple[dict]:
     
     if sweep_config is None:
         warnings.warn("No available sweep found")
+        config = update_config(config) # update config anyways
     
     return config, sweep_config
 
@@ -250,7 +251,6 @@ def combination_sweep(exp_dir, mode="combination"):
                             cat = param_categories[param]
                             
                             # update the config file for the current sweep
-                            config_sweep = config.copy()
                             config_sweep[cat][param] = val
                             config_sweep = update_config(config_sweep)
                             
@@ -306,51 +306,42 @@ def update_config(config: dict)->dict:
         dict: updated config
     """    
     
-    if config.model.comps_embed_enc == "concat":
-        if config.model.d_model_enc == None:
+    if config.model.model_object == "proT":
+    
+        if config.model.comps_embed_enc == "concat":
+            #if config.model.d_model_enc == None:
             config.model.d_model_enc = config.model.enc_val_emb_hidden + config.model.enc_var_emb_hidden + config.model.enc_pos_emb_hidden + config.model.enc_time_emb_hidden
-    
-    if config.model.comps_embed_dec == "concat":    
-        if config.model.d_model_dec == None:
+
+        if config.model.comps_embed_dec == "concat":    
+            #if config.model.d_model_dec == None:
             config.model.d_model_dec = config.model.dec_val_emb_hidden + config.model.dec_var_emb_hidden + config.model.dec_pos_emb_hidden + config.model.dec_time_emb_hidden
-    
-    
-    if config.model.comps_embed_enc == "summation":
-        
-        config.model.d_model_enc = config.model.d_model_set
-        
-    #     config.model.d_model_enc = config.model.d_model_set
-    #     config.model.enc_val_emb_hidden = config.model.d_model_set
-    #     config.model.enc_pos_emb_hidden = config.model.d_model_set
-    #     config.model.enc_var_emb_hidden = config.model.d_model_set
-    #     config.model.enc_time_emb_hidden = config.model.d_model_set
-            
-    if config.model.comps_embed_dec == "summation":
-        
-        config.model.d_model_dec = config.model.d_model_set
-        
-        
-    #     config.model.d_model_dec = config.model.d_model_set
-    #     config.model.dec_val_emb_hidden = config.model.d_model_set
-    #     config.model.dec_pos_emb_hidden = config.model.d_model_set
-    #     config.model.dec_var_emb_hidden = config.model.d_model_set
-    #     config.model.dec_time_emb_hidden = config.model.d_model_set
-    # TODO maybe add assertion for checking embedding dimensions
-    
-    if config.model.comps_embed_enc == "spatiotemporal":
-        if config.model.d_model_enc == None:
+
+        if config.model.comps_embed_enc == "summation":
+
             config.model.d_model_enc = config.model.d_model_set
-            # config.model.enc_pos_emb_hidden = config.model.d_model_set
-            # config.model.enc_var_emb_hidden = config.model.d_model_set
-    
-    if config.model.comps_embed_dec == "spatiotemporal":    
-        if config.model.d_model_dec == None:
+            config.model.d_base_emb = config.model.d_model_set
+
+        if config.model.comps_embed_dec == "summation":
+
             config.model.d_model_dec = config.model.d_model_set
-            # config.model.dec_pos_emb_hidden = config.model.d_model_set
-            # config.model.dec_var_emb_hidden = config.model.d_model_set
-    
-    if config.training.optimization in [3,4,5,6,7]:
-        config.model.ds_embed_enc.set.sparse_grad = True
-    
+            config.model.d_base_emb = config.model.d_model_set
+
+        if config.model.comps_embed_enc == "spatiotemporal":
+            if config.model.d_model_enc == None:
+                config.model.d_model_enc = config.model.d_model_set
+
+        if config.model.comps_embed_dec == "spatiotemporal":    
+            if config.model.d_model_dec == None:
+                config.model.d_model_dec = config.model.d_model_set
+
+        if config.training.optimization in [3,4,5,6,7]:
+            config.model.ds_embed_enc.set.sparse_grad = True
+            
+            
+    if config.model.model_object in ["GRU","LSTM", "TCN"]:
+        D_in = len(config.model.kwargs.ds_embed_in.modules)
+        D_trg = len(config.model.kwargs.ds_embed_trg.modules)        
+        config.model.kwargs.d_in = D_in*config.experiment.d_model_set
+        config.model.kwargs.d_emb = D_trg*config.experiment.d_model_set
     
     return config

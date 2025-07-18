@@ -22,6 +22,7 @@ class ProcessDataModule(pl.LightningDataModule):
         batch_size: int, 
         num_workers: int,
         data_format: str,
+        max_data_size: int=None,
         seed:int=42,
         ) -> None:
         
@@ -33,6 +34,7 @@ class ProcessDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.data_format = data_format
+        self.max_data_size = max_data_size
         self.seed = seed
         self.X = None
         self.Y = None
@@ -45,11 +47,15 @@ class ProcessDataModule(pl.LightningDataModule):
         
         
     def prepare_data(self) -> None:
+        
         if self.X is None:
             self.X = np.load(join(self.data_dir, self.input_file), allow_pickle=True, mmap_mode='r')
         if self.Y is None:
             self.Y = np.load(join(self.data_dir, self.target_file), allow_pickle=True, mmap_mode='r')
-        
+            
+        if self.max_data_size is not None:
+            self.X = self.X[:self.max_data_size]
+            self.Y = self.Y[:self.max_data_size]
     
     def get_ds_len(self)->int:
         
@@ -84,6 +90,8 @@ class ProcessDataModule(pl.LightningDataModule):
         X = torch.Tensor(self.X.astype(self.data_format))
         Y = torch.Tensor(self.Y.astype(self.data_format))
         
+        self.all_ds = TensorDataset(X,Y)
+        
         if self.train_idx is not None and self.val_idx is not None and self.test_idx is not None:
             self.train_ds = TensorDataset(X[self.train_idx], Y[self.train_idx])
             self.val_ds   = TensorDataset(X[self.val_idx], Y[self.val_idx])
@@ -112,7 +120,6 @@ class ProcessDataModule(pl.LightningDataModule):
             persistent_workers=True,
             shuffle = False,
         )
-
     
     def test_dataloader(self,):
         return DataLoader(
@@ -122,11 +129,20 @@ class ProcessDataModule(pl.LightningDataModule):
             persistent_workers=True,
             shuffle = False,
         )
-        
+    
     def pred_test_dataloader(self):
         return DataLoader(
             self.test_ds,
             batch_size = 1,
+            num_workers = self.num_workers,
+            persistent_workers=True,
+            shuffle = False,
+        )
+    
+    def all_dataloader(self):
+        return DataLoader(
+            self.all_ds,
+            batch_size = self.batch_size,
             num_workers = self.num_workers,
             persistent_workers=True,
             shuffle = False,
