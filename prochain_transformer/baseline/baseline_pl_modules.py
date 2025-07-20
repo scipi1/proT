@@ -7,13 +7,11 @@ import sys
 from os.path import abspath, join
 ROOT_DIR = dirname(dirname(abspath(__file__)))
 sys.path.append(ROOT_DIR)
-from prochain_transformer.baseline.baseline_models import RNN, TCN
+from prochain_transformer.baseline.baseline_models import RNN, TCN, MLP
 
 
 class RNNForecaster(pl.LightningModule):
-    """
     
-    """
     def __init__(self, config):
         super().__init__()
         
@@ -25,6 +23,9 @@ class RNNForecaster(pl.LightningModule):
             
         elif config["model"]["model_object"] == "TCN":
             self.model = TCN(**config["model"]["kwargs"])
+            
+        elif config["model"]["model_object"] == "MLP":
+            self.model = MLP(**config["model"]["kwargs"])
         
         
         

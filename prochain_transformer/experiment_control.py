@@ -338,7 +338,7 @@ def update_config(config: dict)->dict:
             config.model.ds_embed_enc.set.sparse_grad = True
             
             
-    if config.model.model_object in ["GRU","LSTM", "TCN"]:
+    if config.model.model_object in ["GRU","LSTM", "TCN","MLP"]:
         D_in = len(config.model.kwargs.ds_embed_in.modules)
         D_trg = len(config.model.kwargs.ds_embed_trg.modules)        
         config.model.kwargs.d_in = D_in*config.experiment.d_model_set

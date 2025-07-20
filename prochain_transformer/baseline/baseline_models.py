@@ -6,33 +6,8 @@ ROOT_DIR = dirname(dirname(abspath(__file__)))
 sys.path.append(ROOT_DIR)
 from prochain_transformer.modules.embedding import ModularEmbedding
 
-# TODO: delete
-# class GRUBaseline(nn.Module):
-#     def __init__(self, d_in, d_hidden, n_layers, d_out, comps_embed, ds_embed):
-#         super().__init__()
-        
-#         device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-#         self.embedding = ModularEmbedding(
-#             ds_embed=ds_embed,
-#             comps=comps_embed,
-#             device=device)
-        
-#         self.gru = nn.GRU(
-#             d_in, 
-#             d_hidden, 
-#             n_layers,
-#             batch_first=True
-#             )
-#         self.head = nn.Linear(d_hidden, d_out)
-        
-        
-#     def forward(self, x):           
-#         x = self.embedding(x)
-#         _, h_n = self.gru(x)        # h_n: (n_layers,N,d_hidden)
-#         return self.head(h_n[-1])   # (N,d_out)
-    
-    
+
+
 class RNN(nn.Module):
     def __init__(
         self, 
@@ -43,8 +18,8 @@ class RNN(nn.Module):
         n_layers, 
         comps_embed, 
         ds_embed_in, 
-        ds_embed_trg):
-        
+        ds_embed_trg
+        ):
         super().__init__()
         
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -101,41 +76,19 @@ class RNN(nn.Module):
 
 
 
-
-# class TCNBaseline(nn.Module):
-#     def __init__(self, d_in, channels, kernel=3, d_out=1):
-#         super().__init__()
-#         layers = []
-#         for i, ch in enumerate(channels):
-#             dilation = 2**i
-#             layers += [nn.Conv1d(d_in if i==0 else channels[i-1],
-#                                  ch, kernel,
-#                                  padding=(kernel-1)*dilation,
-#                                  dilation=dilation),
-#                        nn.ReLU()]
-#         self.tcn = nn.Sequential(*layers)
-#         self.head = nn.Linear(channels[-1], d_out)
-
-#     def forward(self, x):               # x: (N,L,D)
-#         x = x.permute(0,2,1)            # (N,D,L) → Conv1d
-#         out = self.tcn(x)               # (N,C,L)
-#         out = out.mean(-1)              # global avg pool over time
-#         return self.head(out)           # (N,d_out)
-    
-    
-    
-    
 class TCN(nn.Module):
-    def __init__(self,
-                 model: str,
-                 d_in: int,           # input embedding dim
-                 d_emb: int,          # target embedding dim
-                 channels: list[int], # conv widths e.g. [64, 64, 128]
-                 comps_embed,
-                 ds_embed_in,
-                 ds_embed_trg,
-                 kernel: int = 3,
-                 d_out: int = 1):
+    def __init__(
+        self,
+        model: str,
+        d_in: int,           # input embedding dim
+        d_emb: int,          # target embedding dim
+        channels: list[int], # conv widths e.g. [64, 64, 128]
+        comps_embed,
+        ds_embed_in,
+        ds_embed_trg,
+        kernel: int = 3,
+        d_out: int = 1
+        ):
         super().__init__()
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -191,3 +144,66 @@ class TCN(nn.Module):
         # 4) time-distributed prediction
         out = self.head(z).squeeze(-1)  # B × L_out
         return out
+
+
+
+class MLP(nn.Module):
+    def __init__(
+        self,
+        model,
+        d_in: int,
+        d_emb: int,
+        comps_embed,
+        ds_embed_in,
+        ds_embed_trg,
+        hidden: list[int] = [256, 256],
+        d_out: int = 1
+        ):
+        super().__init__()
+        
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        self.input_embedding  = ModularEmbedding(
+            ds_embed=ds_embed_in,  
+            comps=comps_embed, 
+            device=device)
+        
+        self.target_embedding = ModularEmbedding(
+            ds_embed=ds_embed_trg, 
+            comps=comps_embed, 
+            device=device)
+
+        # mean-pool along the sequence length L_in
+        self.pool = lambda x: x.mean(dim=1)           # B × d_in
+
+        #  MLP over pooled context
+        layers, in_dim = [], d_in
+        for h in hidden:
+            layers += [nn.Linear(in_dim, h), nn.ReLU()]
+            in_dim = h
+        self.mlp = nn.Sequential(*layers)             # ctx: B × h_last
+
+        # final projection layer
+        self.head = nn.Linear(hidden[-1] + d_emb, d_out)
+
+    def forward(self, X, y):
+        
+        # input and target embeddings
+        X = self.input_embedding(X)                         # input emb --> B × L_in × d_in_emb
+        yemb = self.target_embedding(y)                     # target emb --> B × L_out × d_emb
+        _, L_out, _ = y.shape
+        
+        # MLP forward pass
+        ctx  = self.mlp(self.pool(X))                       # input emb --> B × h_last
+        
+        # expand context to match the target embeddings
+        ctx_exp = ctx.unsqueeze(1).expand(-1, L_out, -1)    # input emb --> B × L_out × h_last
+        
+        # concatenate target embeddings with context
+        z   = torch.cat([yemb, ctx_exp], -1)                # input emb --> B × L_out × (h_last+d_emb)
+        
+        # final projection
+        out = self.head(z).squeeze(-1)
+        
+        return out
+

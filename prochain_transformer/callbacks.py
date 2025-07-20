@@ -19,7 +19,8 @@ class PerRunManifest(pl.Callback):
         self.config = config
         self.tag    = tag
         self.path   = path
-
+        self.manifest_f = Path(ROOT_DIR) / "logs" / "manifest.ldjson"
+        self.record = None
     # helpers
     def _gather_common(self):
         return {
@@ -30,22 +31,33 @@ class PerRunManifest(pl.Callback):
             "path"      : self.path
         }
 
-    def _write_manifest(self, new_fields: dict):
-        log_dir = join(ROOT_DIR,"logs")
-        info_f  = Path(join(log_dir,"manifest.json"))
+    # def _write_manifest(self, new_fields: dict):
+    #     log_dir = join(ROOT_DIR,"logs")
+    #     info_f  = Path(join(log_dir,"manifest.json"))
 
-        # load previous if exists
-        if info_f.exists():
-            with open(info_f) as f:
-                entry = json.load(f)
+    #     # load previous if exists
+    #     if info_f.exists():
+    #         with open(info_f) as f:
+    #             entry = json.load(f)
+    #     else:
+    #         entry = {}
+    #     entry.update(self._gather_common())  
+    #     entry.update(new_fields)                    
+
+    #     with open(info_f, "w") as f:
+    #         json.dump(entry, f, indent=2)
+            
+    def _append(self, fields: dict):
+        if self.record is None:
+            self.record = {**self._gather_common(), **fields}
         else:
-            entry = {}
-
-        entry.update(self._gather_common())  
-        entry.update(new_fields)                    
-
-        with open(info_f, "w") as f:
-            json.dump(entry, f, indent=2)
+            self.record.update(fields)
+        self.manifest_f.parent.mkdir(parents=True, exist_ok=True)
+        
+    def _write_manifest(self):
+        with open(self.manifest_f, "a") as f:               # APPEND mode
+            f.write(json.dumps(self.record, default=str) + "\n")
+    
     
     def _elapsed(self):
         return time.time() - getattr(self, "_fit_start_time", time.time())
@@ -55,10 +67,10 @@ class PerRunManifest(pl.Callback):
     def on_fit_start(self,trainer, pl_module):
         self._fit_start_time = time.time()
     
-    def on_validation_epoch_end(self, trainer, pl_module):
+    def on_fit_end(self, trainer, pl_module):
         m = trainer.logged_metrics
         epochs_run = trainer.current_epoch
-        self._write_manifest({
+        self._append({
             "val_loss"      : float(m.get("val_loss", float("nan"))),
             "val_mae"       : float(m.get("val_mae",  float("nan"))),
             "val_r2"        : float(m.get("val_r2",   float("nan"))),
@@ -69,12 +81,13 @@ class PerRunManifest(pl.Callback):
 
     def on_test_end(self, trainer, pl_module):
         m = trainer.logged_metrics
-        self._write_manifest({
+        self._append({
             "test_loss" : float(m.get("test_loss", float("nan"))),
             "test_mae"  : float(m.get("test_mae", float("nan"))),
             "test_r2"   : float(m.get("test_r2", float("nan"))),
             "test_rmse" : float(m.get("test_rmse", float("nan")))
         })
+        self._write_manifest()
 
 
 early_stopping_callbacks = EarlyStopping(

@@ -1,9 +1,9 @@
 import numpy as np
+import pandas as pd
 import logging
 from os.path import dirname, abspath, join
 import os
 import sys
-from os.path import abspath, join
 sys.path.append(dirname(dirname(abspath(__file__))))
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger, CSVLogger
@@ -24,7 +24,7 @@ from pytorch_lightning.callbacks import LearningRateMonitor
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 
-def global_kfold_train(
+def trainer(
     config: dict,
     data_dir: str,
     save_dir: str,
@@ -92,8 +92,12 @@ def global_kfold_train(
     k_folds = config["training"]["k_fold"]
     kfold = KFold(n_splits=k_folds, shuffle=True, random_state=seed)
     
+    metrics_dict = {}
     
     for fold, (train_local_idx, val_local_idx) in enumerate(kfold.split(train_val_idx)):
+        
+        # initialize fold metric dictionary
+        
         
         # re-initialize the model at any fold
         model = model_object(config)
@@ -150,25 +154,39 @@ def global_kfold_train(
         # * other stuff we can do
         # trainer.tune() to find optimal hyperparameters
 
+        # training
         trainer.fit(
             model,
             dm,
             ckpt_path=resume_ckpt, # resume training from checkpoint
         )
 
+        # validation
         trainer.validate(model, dm)
+        val_metrics = trainer.callback_metrics.copy()
+        
+        # test
         trainer.test(model, dm)
+        test_metrics = trainer.callback_metrics.copy()
+        
+        # update metrics dictionary
+        metrics_dict[fold] = {**val_metrics, **test_metrics}
+    
+    # Convert the dictionary to a pandas DataFrame
+    df_metric = pd.DataFrame.from_dict(metrics_dict, orient='index')
+    df_metric = df_metric.applymap(lambda x: x.item() if isinstance(x, torch.Tensor) else x) # Convert tensor values to floats
     
     if plot_pred_check:
         mk_quick_pred_plot(model=model, dm=dm, val_idx=config["data"]["val_idx"], save_dir=save_dir)
 
+    return df_metric
 
 
 
 def get_model_object(config: dict)->pl.LightningModule:
     
     model_obj = config["model"]["model_object"]
-    available_models = ["proT","LSTM","GRU", "TCN"]
+    available_models = ["proT","LSTM","GRU", "TCN", "MLP"]
     
     assert model_obj in available_models, AssertionError(f"{model_obj} unavailable! Choose between {available_models}")
 
@@ -177,6 +195,7 @@ def get_model_object(config: dict)->pl.LightningModule:
     "GRU" : RNNForecaster,
     "LSTM": RNNForecaster,
     "TCN": RNNForecaster,
+    "MLP": RNNForecaster,
     }
     return MODEL_REGISTRY[model_obj]
 
@@ -192,15 +211,15 @@ if __name__ == "__main__":
     """
     
     ROOT_DIR = dirname(dirname(abspath(__file__)))
-    exp_dir = join(ROOT_DIR, "experiments/training/test_TCN_dyconex")
+    exp_dir = join(ROOT_DIR, "experiments/training/test_MLP_ishigami")
     data_dir = join(ROOT_DIR, "data/input/")
     
-    config = OmegaConf.load(join(exp_dir,"config_TCN_v1-0-0_dyconex.yaml"))
+    config = OmegaConf.load(join(exp_dir,"config_MLP_v1-0-0_ishigami.yaml"))
     config_updated = update_config(config)
         
     save_dir = exp_dir
     
-    global_kfold_train(
+    trainer(
         config = config_updated,
         data_dir = data_dir, 
         save_dir = save_dir,
