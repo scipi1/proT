@@ -2,8 +2,8 @@ from os.path import dirname, abspath
 import sys
 sys.path.append(dirname(dirname(abspath(__file__))))
 
-from prochain_transformer.modules.encoder import Encoder,EncoderLayer
-from prochain_transformer.modules.extra_layers import Normalization
+from proT.modules.encoder import Encoder,EncoderLayer
+from proT.modules.extra_layers import Normalization
 from test_attention import main as get_test_attention
 from test_embedding import main as get_test_embedding
 

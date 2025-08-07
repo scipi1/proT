@@ -2,7 +2,7 @@ from os.path import dirname, abspath
 import sys
 sys.path.append(dirname(dirname(abspath(__file__))))
 
-from prochain_transformer.modules.embedding import Embedding
+from proT.modules.embedding import Embedding
 import torch
 
 BATCH_SIZE = 1

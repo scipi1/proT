@@ -3,7 +3,7 @@ import sys
 ROOT_DIR = dirname(dirname(abspath(__file__)))
 sys.path.append(ROOT_DIR)
 
-from prochain_transformer.modules.embedding import ModularEmbedding
+from proT.modules.embedding import ModularEmbedding
 import torch
 import numpy as np
 

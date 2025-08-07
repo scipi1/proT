@@ -5,8 +5,8 @@ from os.path import dirname, abspath, join
 import sys
 sys.path.append(dirname(dirname(abspath(__file__))))
 
-from prochain_transformer.model import Spacetimeformer
-from prochain_transformer.old_.config import get_folders
+from proT.proT_model import ProT
+from proT.old_.config import get_folders
 
 DATA_DIR,INPUT_DIR,_,_ = get_folders(key="local")
 
@@ -60,7 +60,7 @@ if data == "real":
     
 
 
-model = Spacetimeformer(d_time=time_comp)
+model = ProT(d_time=time_comp)
 
 
 print(f"Shapes enc_x, dec_x: {enc_x.shape}, {dec_x.shape}")

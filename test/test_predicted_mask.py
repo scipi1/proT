@@ -6,11 +6,11 @@ from os.path import dirname, abspath, join
 import sys
 sys.path.append(dirname(dirname(abspath(__file__))))
 
-from prochain_transformer.forecaster import TransformerForecaster
-from prochain_transformer.dataloader import ProcessDataModule
-from prochain_transformer.predict import predict
-from prochain_transformer.labels import *
-from prochain_transformer.old_.config import load_config
+from proT.forecaster import TransformerForecaster
+from proT.dataloader import ProcessDataModule
+from proT.predict import predict
+from proT.labels import *
+from proT.old_.config import load_config
 
 torch.manual_seed(42)
 np.random.seed(42)

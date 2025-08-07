@@ -1,9 +1,0 @@
-2025-07-19 19:56:36,908 - INFO - Combination sweep with experiment-hidden_set: [128, 128], experiment-d_model_set: 10, experiment-d_hidden_set: 10
-2025-07-19 19:56:39,378 - INFO - Fold 1/2
-2025-07-19 19:57:52,697 - INFO - Fold 2/2
-2025-07-19 19:59:14,038 - INFO - Combination sweep with experiment-hidden_set: [128, 128], experiment-d_model_set: 10, experiment-d_hidden_set: 20
-2025-07-19 19:59:14,079 - INFO - Fold 1/2
-2025-07-19 20:00:36,285 - INFO - Fold 2/2
-2025-07-19 20:01:55,459 - INFO - Combination sweep with experiment-hidden_set: [128, 128], experiment-d_model_set: 10, experiment-d_hidden_set: 40
-2025-07-19 20:01:55,548 - INFO - Fold 1/2
-2025-07-19 20:03:12,764 - INFO - Fold 2/2
