@@ -58,7 +58,7 @@ class EncoderLayer(nn.Module):
         
         
         # self-attention queries=keys=values=X
-        X1, attn = self.global_attention(
+        X1, attn, ent = self.global_attention(
             query=X1,
             key=X1,
             value=X1,
@@ -86,7 +86,7 @@ class EncoderLayer(nn.Module):
         # final res connection
         encoder_out = X + X1
         
-        return encoder_out, attn
+        return encoder_out, attn, ent
     
     
 class Encoder(nn.Module):
@@ -111,10 +111,10 @@ class Encoder(nn.Module):
         
         X = self.emb_dropout(X)
 
-        attn_list = []
+        attn_list, ent_list = [], []
         
         for _, encoder_layer in enumerate(self.layers):
-            X, attn = encoder_layer(
+            X, attn, ent = encoder_layer(
                 X=X, 
                 mask_miss_k=mask_miss_k, 
                 mask_miss_q=mask_miss_q, 
@@ -122,8 +122,9 @@ class Encoder(nn.Module):
                 causal_mask=causal_mask) 
             
             attn_list.append(attn)
+            ent_list.append(ent)
             
         if self.norm_layer is not None:
             X = self.norm_layer(X, ~mask_miss_q)
 
-        return X, attn_list
+        return X, attn_list, ent_list

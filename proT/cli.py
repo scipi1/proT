@@ -11,7 +11,7 @@ from omegaconf import OmegaConf
 
 # Local imports
 sys.path.append(dirname(dirname(abspath(__file__))))
-from proT.experiment_control import combination_sweep, independent_sweep
+from proT.experiment_control import combination_sweep
 from proT.modules.utils import mk_fname, find_last_checkpoint
 from proT.old_.kfold_train import kfold_train
 from proT.optuna_opt import OptunaStudy

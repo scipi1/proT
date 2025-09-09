@@ -81,7 +81,7 @@ class DecoderLayer(nn.Module):
         
         X1 = self.norm1(X, not_self_mask_miss_q)
         
-        X1, dec_self_att = self.global_self_attention(
+        X1, self_att, self_ent = self.global_self_attention(
             query=X1,
             key=X1,
             value=X1,
@@ -95,7 +95,7 @@ class DecoderLayer(nn.Module):
         
         X3 = self.norm2(X2, not_self_mask_miss_q)
         
-        X3, dec_cross_att = self.global_cross_attention(
+        X3, cross_att, cross_ent = self.global_cross_attention(
             query=X3,
             key=enc_out,
             value=enc_out,
@@ -121,7 +121,7 @@ class DecoderLayer(nn.Module):
         # final res connection
         decoder_out = X4 + X5
 
-        return decoder_out, dec_self_att, dec_cross_att
+        return decoder_out, self_att, cross_att, self_ent, cross_ent
     
     
 class Decoder(nn.Module):
@@ -149,12 +149,12 @@ class Decoder(nn.Module):
         
         X = self.emb_dropout(X)
 
-        dec_self_att_list = []
-        dec_cross_att_list = []
+        self_att_list, cross_att_list = [], []
+        self_enc_list, cross_enc_list = [], []
         
         for _, decoder_layer in enumerate(self.layers):
             
-            X, dec_self_att, dec_cross_att = decoder_layer(
+            X, self_att, cross_att, self_enc, cross_enc = decoder_layer(
                 X=X, 
                 enc_out=enc_out, 
                 self_mask_miss_k=self_mask_miss_k, 
@@ -165,11 +165,13 @@ class Decoder(nn.Module):
                 causal_mask=causal_mask
                 )
             
-            dec_self_att_list.append(dec_self_att)
-            dec_cross_att_list.append(dec_cross_att)
+            self_att_list.append(self_att)
+            cross_att_list.append(cross_att)
+            self_enc_list.append(self_enc)
+            cross_enc_list.append(cross_enc)
 
         if self.norm_layer is not None:
             not_self_mask_miss_q = ~self_mask_miss_q if self_mask_miss_q is not None else None
             X = self.norm_layer(X, not_self_mask_miss_q)
 
-        return X, dec_self_att_list, dec_cross_att_list
+        return X, self_att_list, cross_att_list, self_enc_list, cross_enc_list

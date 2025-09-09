@@ -27,9 +27,9 @@ def predict(
     model: pl.LightningModule,
     dm: pl.LightningDataModule,
     dataset_label: str,
-    # input_mask: torch.Tensor=None, # TODO: delete
     debug_flag: bool=False,
-    kwargs=None)-> Tuple[np.ndarray, np.ndarray, np.ndarray, list]:
+    show_trg_max_idx: int=None)-> Tuple[np.ndarray, np.ndarray, np.ndarray, list, list, list]:
+    
     """
     Makes prediction feeding the `model` with the dataset specified by a data module
     and a label.
@@ -58,7 +58,7 @@ def predict(
     forecaster = model.to(device)
     forecaster.eval()
     
-    input_list, output_list, target_list,cross_att_list = nn.ParameterList(), nn.ParameterList(), nn.ParameterList(), nn.ParameterList()
+    input_list, output_list, target_list, cross_att_list,enc_self_att_list, dec_self_att_list = nn.ParameterList(), nn.ParameterList(), nn.ParameterList(), nn.ParameterList(), nn.ParameterList(), nn.ParameterList()
     
     # prepare data module
     dm.prepare_data()
@@ -89,9 +89,11 @@ def predict(
         X,trg = batch
         
         with torch.no_grad():
-            forecast_output, recon_output, (enc_self_att, dec_self_att, dec_cross_att), enc_mask = forecaster.forward(
+            forecast_output,_,(enc_self_att, dec_self_att, dec_cross_att),_, _ = forecaster.forward(
                 data_input=X,
                 data_trg=trg,
+                show_trg_max_idx=show_trg_max_idx,
+                predict_mode=True,
                 )
             
         # append batch predictions
@@ -99,6 +101,8 @@ def predict(
         output_list.append(forecast_output)
         target_list.append(trg)
         cross_att_list.append(dec_cross_att[0])
+        enc_self_att_list.append(enc_self_att[0])
+        dec_self_att_list.append(dec_self_att[0])
 
         if debug_flag:
             print("Debug mode: stopping after one batch...")
@@ -109,20 +113,24 @@ def predict(
     output_tensor = torch.cat([t.cpu().detach() for t in output_list], dim=0)
     target_tensor = torch.cat([t.cpu().detach() for t in target_list], dim=0)
     cross_att_tensor = torch.cat([t.cpu().detach() for t in cross_att_list], dim=0)
+    enc_self_att_tensor = torch.cat([t.cpu().detach() for t in enc_self_att_list], dim=0)
+    dec_self_att_tensor = torch.cat([t.cpu().detach() for t in dec_self_att_list], dim=0)
     
     # convert predictions to numpy
     input_array = input_tensor.numpy().squeeze()
     output_array = output_tensor.numpy().squeeze()
     target_array = target_tensor.numpy().squeeze()
     cross_att_array = cross_att_tensor.numpy().squeeze()
+    enc_self_att_array = enc_self_att_tensor.numpy().squeeze()
+    dec_self_att_array = dec_self_att_tensor.numpy().squeeze()
     
-    return input_array, output_array, target_array, cross_att_array
+    return input_array, output_array, target_array, cross_att_array, enc_self_att_array, dec_self_att_array
 
 
 
 def mk_quick_pred_plot(model: pl.LightningModule, dm: pl.LightningDataModule, val_idx: int, save_dir: Path):
     
-    input_array, output_array, target_array, cross_att_array = predict(model=model, dm=dm, dataset_label="test")
+    input_array, output_array, target_array, cross_att_array,_,_ = predict(model=model, dm=dm, dataset_label="test")
     
     # in case we have only one sample
     if len(output_array.shape) == 1:
@@ -186,6 +194,7 @@ def predict_test_from_ckpt(
     checkpoint_path: Path,
     external_dataset: dict=None,
     dataset_label: str="test",
+    show_trg_max_idx: int=None,
     cluster: bool=False
     )->Tuple[np.ndarray]:
     
@@ -260,14 +269,15 @@ def predict_test_from_ckpt(
         raise RuntimeError("Model parameters seem uninitialized. Check the checkpoint path.")
     
     # call predict
-    input_array, output_array, target_array, cross_att_array = predict(
+    input_array, output_array, target_array, cross_att_array, enc_self_att_array, dec_self_att_array = predict(
         model=forecaster,
         dm=dm,
         dataset_label = dataset_label,
         debug_flag=False,
+        show_trg_max_idx=show_trg_max_idx
         )
     
-    return input_array, output_array, target_array, cross_att_array
+    return input_array, output_array, target_array, cross_att_array, enc_self_att_array, dec_self_att_array
 
 
 

@@ -148,7 +148,7 @@ def trainer(
         callbacks_list.append(data_index_tracker)
         
         # Add attention entropy logging callback
-        entropy_enabled = False
+        entropy_enabled = True
         callbacks_list.append(AttentionEntropyLogger(enabled=entropy_enabled))
         
         if "early_stopping" in config["special"]["mode"]:
@@ -266,7 +266,7 @@ if __name__ == "__main__":
     import re
     
     ROOT_DIR = dirname(dirname(abspath(__file__)))
-    exp_dir = join(ROOT_DIR, "experiments/training/tests/test_PINN")
+    exp_dir = join(ROOT_DIR, "experiments/training/tests/test_entropy")
     data_dir = join(ROOT_DIR, "data/input/")
     
     # look for config file

@@ -1,4 +1,5 @@
 data/
 experiments/
 myenv/
-**/log*.log
+log*
+!log*/

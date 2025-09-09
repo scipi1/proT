@@ -73,6 +73,7 @@ class ProT(nn.Module):
         d_model_enc: int,
         d_model_dec: int,
         d_qk: int,
+        given_target_max_pos: int = None,
         ):
         super().__init__()
         
@@ -101,8 +102,8 @@ class ProT(nn.Module):
             "mask_type"         : enc_mask_type,
             "dropout_qkv"       : enc_dropout_qkv,
             "attention_dropout" : enc_attention_dropout,
-            "register_entropy"  : False,        # Enable entropy registration for cross-attention
-            "layer_name"        : None          # Name for entropy registration
+            "register_entropy"  : True,                     # Enable entropy registration for encoder self-attention
+            "layer_name"        : "enc_self_att"            # Name for entropy registration
         }
         
         attn_dec_self_kwargs = {
@@ -113,8 +114,8 @@ class ProT(nn.Module):
             "mask_type"         : dec_self_mask_type,
             "dropout_qkv"       : dec_self_dropout_qkv,
             "attention_dropout" : dec_self_attention_dropout,
-            "register_entropy"  : False,        # Enable entropy registration for cross-attention
-            "layer_name"        : None          # Name for entropy registration
+            "register_entropy"  : True,                     # Enable entropy registration for decoder self-attention
+            "layer_name"        : "enc_self_att"            # Name for entropy registration
         }
         
         attn_dec_cross_kwargs = {
@@ -125,8 +126,8 @@ class ProT(nn.Module):
             "mask_type"         : dec_cross_mask_type,
             "dropout_qkv"       : dec_cross_dropout_qkv,
             "attention_dropout" : dec_cross_attention_dropout,
-            "register_entropy" : True,          # Enable entropy registration for cross-attention
-            "layer_name": "cross_attention"     # Name for entropy registration
+            "register_entropy" : True,                      # Enable entropy registration for cross-attention
+            "layer_name": "cross_att"                       # Name for entropy registration
         }
         
         self.causal_mask = causal_mask
@@ -181,6 +182,7 @@ class ProT(nn.Module):
         self,
         input_tensor,
         target_tensor,
+        trg_pos_mask=None
         ):
         
         # embed input and get mask for missing values
@@ -193,7 +195,7 @@ class ProT(nn.Module):
             warnings.warn(f"encoder causal_mask required {self.enc_causal_mask} but encoder got null input positions, set to False.")
         
         # pass embedded input to encoder
-        enc_out, enc_self_att = self.encoder(
+        enc_out, enc_self_att, enc_self_ent = self.encoder(
             X=enc_input,
             mask_miss_k=enc_mask,
             mask_miss_q=enc_mask,
@@ -202,21 +204,24 @@ class ProT(nn.Module):
             )
         
         # embed target
-        dec_input = self.dec_embedding(X=target_tensor)
+        dec_input = self.dec_embedding(X=target_tensor, mask_given=trg_pos_mask)
         dec_input_pos = self.dec_embedding.pass_var(X=target_tensor)
         dec_self_mask=self.dec_embedding.get_mask(X=target_tensor)
+        
+        # get mask for given targets, they don't participate in the cross attention 
+        dec_cross_mask = torch.logical_or(dec_self_mask, torch.logical_not(trg_pos_mask))
         
         if dec_input_pos is None and self.dec_causal_mask == True:
             warnings.warn(f"decoder causal_mask required {self.dec_causal_mask} but encoder got null input positions, set to False.")
         
         # pass embedded target and encoder output to decoder
-        dec_out, dec_self_att, dec_cross_att = self.decoder(
+        dec_out, dec_self_att, dec_cross_att, dec_self_ent, dec_cross_ent = self.decoder(
             X=dec_input,
             enc_out=enc_out,
             self_mask_miss_k=dec_self_mask, 
             self_mask_miss_q=dec_self_mask,
             cross_mask_miss_k=enc_mask, 
-            cross_mask_miss_q=dec_self_mask,
+            cross_mask_miss_q=dec_cross_mask,
             dec_input_pos = dec_input_pos,
             causal_mask=self.dec_causal_mask
             )
@@ -226,7 +231,7 @@ class ProT(nn.Module):
         # reconstruction predictions
         recon_out = self.reconstructor(enc_out)
         
-        return forecast_out, recon_out, (enc_self_att, dec_self_att, dec_cross_att), enc_mask
+        return forecast_out, recon_out, (enc_self_att, dec_self_att, dec_cross_att), enc_mask, (enc_self_ent, dec_self_ent, dec_cross_ent)
     
     
     def _attn(

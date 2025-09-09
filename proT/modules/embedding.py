@@ -80,6 +80,7 @@ class ModularEmbedding(nn.Module):
         self.embed_label_list = []
         self.pass_idx_list = None
         self.mask_idx = None
+        self.mask_given_idx = None
         self.val_idx = None
         
         # unpack settings for spatiotemporal
@@ -95,10 +96,14 @@ class ModularEmbedding(nn.Module):
             idx_, embed_, label_ ,kwargs = var["idx"], var["embed"], var["label"], var["kwargs"]
             
             # assign embedding layers
-            assert embed_ in ["mask", "nn_embedding", "sinusoidal","time2vec","identity","linear","pass","value"], AssertionError("Invalid embedding selected!")
+            assert embed_ in ["mask", "mask_given", "nn_embedding", "sinusoidal","time2vec","identity","linear","pass","value"], AssertionError("Invalid embedding selected!")
             
             if embed_ == "mask":
                 self.mask_idx = idx_
+                emb_module = None
+                
+            if embed_ == "mask_given":
+                self.mask_given_idx = idx_
                 emb_module = None
                 
             if embed_ == "nn_embedding":
@@ -147,7 +152,11 @@ class ModularEmbedding(nn.Module):
         self.embed_modules_list = nn.ModuleList(self.embed_list)
 
 
-    def __call__(self, X: torch.Tensor)->torch.Tensor:
+    def __call__(
+        self, 
+        X: torch.Tensor, 
+        mask_given: torch.Tensor=None # position mask
+        )->torch.Tensor:
         """
         Choose the embedding strategy and apply it to X
         Args:
@@ -155,17 +164,24 @@ class ModularEmbedding(nn.Module):
         Returns:
             torch.Tensor: embedded data
         """
+        
+        if mask_given is not None:
+            mask = mask_given.long()+1 # zero reserved for missing values
+            X_ = torch.cat([X, mask], dim=-1)
+        else:
+            X_ = X
+        
         if self.comps == "concat":
-            return self.concat(X)
+            return self.concat(X_)
         
         elif self.comps == "summation_value":
-            return self.summation_value(X)
+            return self.summation_value(X_)
         
         elif self.comps == "summation":
-            return self.summation(X)
+            return self.summation(X_)
         
         elif self.comps == "spatiotemporal":
-            return self.spatiotemporal(X)
+            return self.spatiotemporal(X_)
         
         
     def concat(self, X: torch.Tensor)->torch.Tensor:
@@ -250,6 +266,10 @@ class ModularEmbedding(nn.Module):
             return None
         else: 
             return X_mask.isnan().unsqueeze(-1)
+        
+        
+        
+        
     
     
     def pass_var(self, X: torch.Tensor)->torch.Tensor:

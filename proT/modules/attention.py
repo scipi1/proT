@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.functional as F
 import numpy as np
 from proT.modules.extra_layers import UniformAttentionMask
-from proT.utils.entropy_utils import register_attention_entropy
+from proT.utils.entropy_utils import register_attention_entropy, calculate_attention_entropy
 from typing import List
 
 class ScaledDotAttention(nn.Module):
@@ -20,6 +20,9 @@ class ScaledDotAttention(nn.Module):
         self.dropout = nn.Dropout(attention_dropout)
         self.register_entropy = register_entropy
         self.layer_name = layer_name
+        
+        self.entropy_enabled = True
+        
         if register_entropy and layer_name is None:
             raise ValueError("If register_entropy is True, layer_name must be provided.")
         
@@ -56,14 +59,13 @@ class ScaledDotAttention(nn.Module):
         # Apply causal mask
         if pos is not None and causal_mask:
             M_causal = build_causal_mask(pos, n_heads=H)
+            
             scores = scores + M_causal
         
         # Apply missing data masks
+        # masking missing value with -inf to force the softmax to zero
+        # (reference https://arxiv.org/abs/2407.11540)
         
-        """
-        masking missing value with -inf to force the softmax to zero
-        (reference https://arxiv.org/abs/2407.11540)
-        """
         if is_multihead:
             # For multi-head: scores shape is (B, H, L, S)
             key_size = scores.size(-1)  # S
@@ -100,8 +102,14 @@ class ScaledDotAttention(nn.Module):
         att = torch.relu(torch.softmax(scale * (scores + M_k), dim=-1) + M_q)
         
         # Attention entropy hook - register entropy before dropout
-        if self.register_entropy:
-            register_attention_entropy(self.layer_name, att)
+        # if self.register_entropy:
+        #     register_attention_entropy(self.layer_name, att)
+        
+        if self.entropy_enabled:
+            entropy = calculate_attention_entropy(att)
+        else:
+            entropy = None
+            
             
         A = torch.nan_to_num(self.dropout(att))
         
@@ -111,7 +119,7 @@ class ScaledDotAttention(nn.Module):
         else:
             V = torch.einsum("bls,bsd->bld", A, value)
         
-        return (V.contiguous(), A)
+        return V.contiguous(), A, entropy
 
 
 def build_causal_mask(p: torch.Tensor, n_heads: int = 1) -> torch.Tensor:
@@ -141,6 +149,31 @@ def build_causal_mask(p: torch.Tensor, n_heads: int = 1) -> torch.Tensor:
     return M
 
 
+def calculate_attention_entropy(att_weights: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Calculate entropy of attention weights.
+    
+    Args:
+        att_weights: Attention weights tensor
+                    - Multi-head: (B, H, L, S) 
+                    - Single-head: (B, L, S)
+        eps: Small value to avoid log(0)
+    
+    Returns:
+        Entropy tensor:
+        - Multi-head: (B, H, L) - entropy for each query position in each head
+        - Single-head: (B, L) - entropy for each query position
+    """
+    # Clamp to avoid log(0)
+    att_clamped = torch.clamp(att_weights, min=eps)
+    
+    # Calculate entropy: -sum(p * log(p)) along the key dimension (last dimension)
+    log_att = torch.log(att_clamped)
+    entropy = -torch.sum(att_weights * log_att, dim=-1)
+    
+    # Handle NaN values that might arise from 0 * log(0)
+    entropy = torch.nan_to_num(entropy, nan=0.0)
+    return entropy
 
 
         
@@ -201,7 +234,7 @@ class AttentionLayer(nn.Module):
             key = self.dropout_qkv(self.key_projection(key)).view(B, S, -1)
             value = self.dropout_qkv(self.value_projection(value)).view(B, S, -1)
             
-        out, attn = self.inner_attention(
+        out, attn, ent = self.inner_attention(
             query=query,
             key=key,
             value=value,
@@ -220,7 +253,7 @@ class AttentionLayer(nn.Module):
             # out shape is already (B, L, d_v)
             out = out.view(B, L, -1)
         
-        return out, attn
+        return out, attn, ent
     
     
     
@@ -251,7 +284,7 @@ def main():
         attention_dropout=0,
         dropout_qkv=0)
     
-    out_single, score_single = attention_single.forward(
+    out_single, score_single, ent = attention_single.forward(
         query=x, 
         key=x, 
         value=x,
@@ -261,7 +294,7 @@ def main():
         causal_mask=False
         )
     
-    print(f"Single-head - Output shape: {out_single.shape}, Score shape: {score_single.shape}")
+    print(f"Single-head - Output shape: {out_single.shape}, Score shape: {score_single.shape}, Entropy shape: {ent.shape if ent is not None else 'None'}")
     
     print("\nTesting multi-head attention (n_heads=4):")
     attention_multi = AttentionLayer(
@@ -275,7 +308,7 @@ def main():
         attention_dropout=0,
         dropout_qkv=0)
     
-    out_multi, score_multi = attention_multi.forward(
+    out_multi, score_multi, ent = attention_multi.forward(
         query=x, 
         key=x, 
         value=x,
@@ -285,13 +318,13 @@ def main():
         causal_mask=False
         )
     
-    print(f"Multi-head - Output shape: {out_multi.shape}, Score shape: {score_multi.shape}")
+    print(f"Multi-head - Output shape: {out_multi.shape}, Score shape: {score_multi.shape}, Entropy shape: {ent.shape if ent is not None else 'None'}")
     
     # Test with causal mask and position
     print("\nTesting with causal mask:")
     pos = torch.arange(seq_len).unsqueeze(0).unsqueeze(-1).float()  # (1, 5, 1)
     
-    out_causal, score_causal = attention_multi.forward(
+    out_causal, score_causal, ent = attention_multi.forward(
         query=x, 
         key=x, 
         value=x,
@@ -301,7 +334,7 @@ def main():
         causal_mask=True
         )
     
-    print(f"Causal multi-head - Output shape: {out_causal.shape}, Score shape: {score_causal.shape}")
+    print(f"Causal multi-head - Output shape: {out_causal.shape}, Score shape: {score_causal.shape}, Entropy shape: {ent.shape if ent is not None else 'None'}")
     print("All tests completed successfully!")
     
     

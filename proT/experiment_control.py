@@ -236,7 +236,7 @@ def update_config(config: dict)->dict:
             config.model.kwargs.d_model_enc = config.model.embed_dim.enc_val_emb_hidden + config.model.embed_dim.enc_var_emb_hidden + config.model.embed_dim.enc_pos_emb_hidden + config.model.embed_dim.enc_time_emb_hidden
             
         if config.model.kwargs.comps_embed_dec == "concat":    
-            config.model.kwargs.d_model_dec = config.model.embed_dim.dec_val_emb_hidden + config.model.embed_dim.dec_var_emb_hidden + config.model.embed_dim.dec_pos_emb_hidden + config.model.embed_dim.dec_time_emb_hidden
+            config.model.kwargs.d_model_dec = config.model.embed_dim.dec_val_emb_hidden + config.model.embed_dim.dec_var_emb_hidden + config.model.embed_dim.dec_pos_emb_hidden + config.model.embed_dim.dec_time_emb_hidden + config.model.embed_dim.dec_val_given_emb_hidden
             
         if config.model.kwargs.comps_embed_enc == "summation":
             config.model.kwargs.d_model_enc = config.model.embed_dim.d_model_set
