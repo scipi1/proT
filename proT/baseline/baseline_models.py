@@ -4,7 +4,7 @@ import sys
 from os.path import abspath, join
 ROOT_DIR = dirname(dirname(abspath(__file__)))
 sys.path.append(ROOT_DIR)
-from proT.modules.embedding import ModularEmbedding
+from proT.core.modules.embedding import ModularEmbedding
 
 
 
