@@ -41,7 +41,7 @@ class ProT(nn.Module):
         dec_cross_attention_type,
         dec_cross_mask_type,
         n_heads: int,
-        causal_mask: bool,
+        #causal_mask: bool,
         enc_causal_mask: bool,
         dec_causal_mask: bool,
         #attn_factor: int = 5, #TODO understand, DO NOT DEL for now!
@@ -128,7 +128,7 @@ class ProT(nn.Module):
             "layer_name": "cross_att"                       # Name for entropy registration
         }
         
-        self.causal_mask = causal_mask
+        #self.causal_mask = causal_mask
         self.enc_causal_mask = enc_causal_mask
         self.dec_causal_mask = dec_causal_mask
         

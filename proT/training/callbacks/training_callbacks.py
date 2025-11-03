@@ -33,7 +33,7 @@ class PerRunManifest(pl.Callback):
     # helpers
     def _gather_common(self):
         return {
-            "timestamp" : datetime.datetime.utcnow().isoformat(timespec="seconds")+"Z",
+            "timestamp" : datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
             "model"     : self.config["model"]["model_object"],
             "dataset"   : self.config["data"]["dataset"],    
             "tag"       : self.tag,

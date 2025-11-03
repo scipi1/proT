@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+import time
 from os.path import dirname, abspath, join
 
 # Third-party imports
@@ -29,7 +30,6 @@ from proT.baseline.baseline_pl_modules import RNNForecaster
 from proT.training.dataloader import ProcessDataModule
 from proT.training.experiment_control import update_config
 from proT.evaluation.predict import mk_quick_pred_plot
-from proT.proj_specific.subroutines.sub_utils import mk_missing_folders
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
@@ -75,6 +75,11 @@ def trainer(
     # get model object from configuration (version 4.6.0 or higher)
     model_object = get_model_object(config)
     
+    # check functions compatibility
+    if plot_pred_check:
+        if model_object not in ["proT"]:
+            raise NotImplementedError("Quick prediction plot not available for the current model, set plot_pred_check=False")
+    
     
     dm = ProcessDataModule(
         data_dir = join(data_dir,config["data"]["dataset"]),
@@ -85,23 +90,37 @@ def trainer(
         data_format = "float32",
         max_data_size = config["data"]["max_data_size"],
         seed = seed,
+        train_file = config["data"].get("train_file", None),
+        test_file = config["data"].get("test_file", None),
+        use_val_split=True
     )
     
     
-    dataset_size = dm.get_ds_len()
-    indices = np.arange(dataset_size)
+    # Check if using pre-split data
+    use_presplit = config["data"].get("train_file") is not None and config["data"].get("test_file") is not None
     
-    test_ds_idx_filename = config["data"]["test_ds_ixd"]
-    
-    if test_ds_idx_filename is not None:
-        test_idx = np.load(join(data_dir,config["data"]["dataset"],test_ds_idx_filename))
-        mask = np.isin(indices, test_idx)
-        train_val_idx = indices[~mask]
+    if use_presplit:
+        # Pre-split data: k-fold only on training data, test is already separate
+        dataset_size = dm.get_ds_len()  # This returns training data size
+        train_val_idx = np.arange(dataset_size)
+        test_idx = None  # Test data is already split separately
+        print("Using pre-split data: k-fold will be applied only to training data.")
     
     else:
-        test_size = int(0.2 * dataset_size)  # Reserve 20% for testing
-        test_idx = indices[:test_size]       # Fixed test indices
-        train_val_idx = indices[test_size:]  # Remaining for train/val cross-validation
+        # Normal data: need to create train/val/test split
+        dataset_size = dm.get_ds_len()
+        indices = np.arange(dataset_size)
+        
+        test_ds_idx_filename = config["data"]["test_ds_ixd"]
+        
+        if test_ds_idx_filename is not None:
+            test_idx = np.load(join(data_dir,config["data"]["dataset"],test_ds_idx_filename))
+            mask = np.isin(indices, test_idx)
+            train_val_idx = indices[~mask]
+        else:
+            test_size = int(0.2 * dataset_size)  # Reserve 20% for testing
+            test_idx = indices[:test_size]       # Fixed test indices
+            train_val_idx = indices[test_size:]  # Remaining for train/val cross-validation
     
     
     
@@ -115,6 +134,11 @@ def trainer(
     # Initialize k-fold results tracker
     kfold_tracker = KFoldResultsTracker(save_dir, k_folds)
     
+    # Count trainable parameters (same for all folds, calculated once)
+    temp_model = model_object(config)
+    trainable_params = sum(p.numel() for p in temp_model.parameters() if p.requires_grad)
+    del temp_model  # Clean up temporary model
+    
     for fold, (train_local_idx, val_local_idx) in enumerate(kfold.split(train_val_idx)):
         
         # re-initialize the model at any fold
@@ -125,7 +149,7 @@ def trainer(
         
         save_dir_k = join(save_dir, f"k_{fold}") # make subfolder for the given fold
         logs_dir = join(save_dir_k, "logs")      # save dir for Tensorboard/CSV logs and checkpoints
-        mk_missing_folders([logs_dir])
+        os.makedirs(logs_dir, exist_ok=True)
 
         # Convert local indices to global indices
         train_global_idx = train_val_idx[train_local_idx]
@@ -183,6 +207,9 @@ def trainer(
         # * other stuff we can do
         # trainer.tune() to find optimal hyperparameters
 
+        # Record start time
+        start_time = time.time()
+
         # training
         trainer.fit(
             model,
@@ -190,9 +217,17 @@ def trainer(
             ckpt_path=resume_ckpt, # resume training from checkpoint
         )
 
-        # validation
-        trainer.validate(model, dm)
-        val_metrics = trainer.callback_metrics.copy()
+        # Calculate training time
+        training_time = time.time() - start_time
+        num_epochs = trainer.current_epoch + 1
+        avg_time_per_epoch = training_time / num_epochs if num_epochs > 0 else 0
+
+        # validation (only if validation dataset exists)
+        if dm.val_ds is not None:
+            trainer.validate(model, dm)
+            val_metrics = trainer.callback_metrics.copy()
+        else:
+            val_metrics = {}
         
         # test
         trainer.test(model, dm)
@@ -219,6 +254,11 @@ def trainer(
             fold_metrics = {**val_metrics, **test_metrics}
             best_checkpoint_path = None
         
+        # Add model size and timing metrics
+        fold_metrics['trainable_params'] = trainable_params
+        fold_metrics['total_training_time'] = training_time
+        fold_metrics['avg_time_per_epoch'] = avg_time_per_epoch
+        
         # Update metrics dictionary
         metrics_dict[fold] = fold_metrics
         
@@ -227,7 +267,7 @@ def trainer(
     
     # Convert the dictionary to a pandas DataFrame
     df_metric = pd.DataFrame.from_dict(metrics_dict, orient='index')
-    df_metric = df_metric.applymap(lambda x: x.item() if isinstance(x, torch.Tensor) else x) # Convert tensor values to floats
+    df_metric = df_metric.map(lambda x: x.item() if isinstance(x, torch.Tensor) else x) # Convert tensor values to floats
     
     if plot_pred_check:
         mk_quick_pred_plot(model=model, dm=dm, val_idx=config["data"]["val_idx"], save_dir=save_dir)
@@ -245,7 +285,7 @@ def get_model_object(config: dict)->pl.LightningModule:
     assert model_obj in available_models, AssertionError(f"{model_obj} unavailable! Choose between {available_models}")
 
     MODEL_REGISTRY = {
-    "proT"          : TransformerForecaster,
+    "proT"          : EntropyRegularizedForecaster,
     "proT_sim"      : SimulatorForecaster,
     "proT_adaptive" : OnlineTargetForecaster,
     "GRU"           : RNNForecaster,
@@ -268,7 +308,7 @@ if __name__ == "__main__":
     import re
     
     ROOT_DIR = dirname(dirname(dirname(abspath(__file__))))
-    exp_dir = join(ROOT_DIR, "experiments/training/tests/test_half_ist_deterministic")
+    exp_dir = join(ROOT_DIR, "experiments/baseline_optuna/baseline_proT_ishigami_sum")
     data_dir = join(ROOT_DIR, "data/input/")
     
     # look for config file
@@ -291,5 +331,5 @@ if __name__ == "__main__":
         experiment_tag = "test", 
         cluster = False, 
         resume_ckpt = None,
-        plot_pred_check = True,
+        plot_pred_check = False,
         debug = True)

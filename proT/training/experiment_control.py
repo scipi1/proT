@@ -219,6 +219,55 @@ def combination_sweep(exp_dir, mode="combination"):
 
 
 
+def calculate_concat_dim(config, embed_prefix: str, modules_path: str) -> int:
+    """
+    Dynamically calculate concatenation dimension by checking which embeddings
+    are actually used in the modules configuration.
+    
+    This prevents errors when:
+    - An embedding dimension exists in config but is not used (embed not in modules)
+    - An embedding dimension doesn't exist in config (e.g., dec_val_given_emb_hidden for non-adaptive models)
+    
+    Args:
+        config: OmegaConf configuration object
+        embed_prefix: "enc" or "dec" 
+        modules_path: Path to modules list (e.g., "model.kwargs.ds_embed_enc.modules")
+        
+    Returns:
+        int: Total dimension for concatenation
+        
+    Example:
+        # For encoder: checks model.kwargs.ds_embed_enc.modules
+        # For decoder: checks model.kwargs.ds_embed_dec.modules
+    """
+    total_dim = 0
+    modules = OmegaConf.select(config, modules_path)
+    
+    if modules is None:
+        return 0
+    
+    # Map embedding labels to their dimension keys in config
+    label_to_dim = {
+        "value": f"{embed_prefix}_val_emb_hidden",
+        "variable": f"{embed_prefix}_var_emb_hidden", 
+        "position": f"{embed_prefix}_pos_emb_hidden",
+        "time": f"{embed_prefix}_time_emb_hidden",
+        "online_pos_mask": f"{embed_prefix}_val_given_emb_hidden",  # For adaptive models
+    }
+    
+    # Check which embeddings are actually used and sum their dimensions
+    for module in modules:
+        label = module.get("label")
+        if label in label_to_dim:
+            dim_key = f"model.embed_dim.{label_to_dim[label]}"
+            dim_value = OmegaConf.select(config, dim_key)
+            # Only add if dimension exists and is > 0
+            if dim_value is not None and dim_value > 0:
+                total_dim += dim_value
+    
+    return total_dim
+
+
 def update_config(config: dict)->dict:
     """
     Updates the config file where placeholders are set 
@@ -230,84 +279,85 @@ def update_config(config: dict)->dict:
         dict: updated config
     """
     
-    assert config.model.model_object in ["proT", "proT_sim", "proT_adaptive", "GRU","LSTM", "TCN","MLP"], AssertionError("This model is not available in experiment_control!")
+    assert config.model.model_object in ["proT", "proT_sim", "proT_adaptive", "GRU","LSTM", "TCN","MLP"], \
+        AssertionError("This model is not available in experiment_control!")
     
-    if config.model.model_object in ["proT", "proT_adaptive"]:
-    
+    # Handle all proT variants (proT, proT_sim, proT_adaptive) with unified logic
+    if config.model.model_object in ["proT", "proT_sim", "proT_adaptive"]:
+        
+        # Encoder dimension calculation
         if config.model.kwargs.comps_embed_enc == "concat":
-            config.model.kwargs.d_model_enc = config.model.embed_dim.enc_val_emb_hidden + config.model.embed_dim.enc_var_emb_hidden + config.model.embed_dim.enc_pos_emb_hidden + config.model.embed_dim.enc_time_emb_hidden
+            config.model.kwargs.d_model_enc = calculate_concat_dim(
+                config, "enc", "model.kwargs.ds_embed_enc.modules"
+            )
             
-        if config.model.kwargs.comps_embed_dec == "concat":    
-            config.model.kwargs.d_model_dec = config.model.embed_dim.dec_val_emb_hidden + config.model.embed_dim.dec_var_emb_hidden + config.model.embed_dim.dec_pos_emb_hidden + config.model.embed_dim.dec_time_emb_hidden
+        elif config.model.kwargs.comps_embed_enc == "summation":
+            # For summation, d_model_set must be defined
+            d_model_set = config.model.embed_dim.d_model_set
+            if d_model_set is None:
+                raise ValueError(
+                    "When using summation embeddings (comps_embed_enc='summation'), "
+                    "you must set 'model.embed_dim.d_model_set' to a numeric value in your config file."
+                )
+            # Set model dimension
+            config.model.kwargs.d_model_enc = d_model_set
+            # Update all encoder embedding dimensions to match d_model_set for summation
+            if config.model.embed_dim.enc_val_emb_hidden is not None and config.model.embed_dim.enc_val_emb_hidden > 0:
+                config.model.embed_dim.enc_val_emb_hidden = d_model_set
+            if config.model.embed_dim.enc_var_emb_hidden is not None and config.model.embed_dim.enc_var_emb_hidden > 0:
+                config.model.embed_dim.enc_var_emb_hidden = d_model_set
+            if config.model.embed_dim.enc_pos_emb_hidden is not None and config.model.embed_dim.enc_pos_emb_hidden > 0:
+                config.model.embed_dim.enc_pos_emb_hidden = d_model_set
+            if config.model.embed_dim.enc_time_emb_hidden is not None and config.model.embed_dim.enc_time_emb_hidden > 0:
+                config.model.embed_dim.enc_time_emb_hidden = d_model_set
             
-        if config.model.kwargs.comps_embed_enc == "summation":
+        elif config.model.kwargs.comps_embed_enc == "spatiotemporal":
             config.model.kwargs.d_model_enc = config.model.embed_dim.d_model_set
+        
+        # Decoder dimension calculation    
+        if config.model.kwargs.comps_embed_dec == "concat":
+            config.model.kwargs.d_model_dec = calculate_concat_dim(
+                config, "dec", "model.kwargs.ds_embed_dec.modules"
+            )
             
-        if config.model.kwargs.comps_embed_dec == "summation":
+        elif config.model.kwargs.comps_embed_dec == "summation":
+            # For summation, d_model_set must be defined
+            d_model_set = config.model.embed_dim.d_model_set
+            if d_model_set is None:
+                raise ValueError(
+                    "When using summation embeddings (comps_embed_dec='summation'), "
+                    "you must set 'model.embed_dim.d_model_set' to a numeric value in your config file."
+                )
+            # Set model dimension
+            config.model.kwargs.d_model_dec = d_model_set
+            # Update all decoder embedding dimensions to match d_model_set for summation
+            if config.model.embed_dim.dec_val_emb_hidden is not None and config.model.embed_dim.dec_val_emb_hidden > 0:
+                config.model.embed_dim.dec_val_emb_hidden = d_model_set
+            if config.model.embed_dim.dec_var_emb_hidden is not None and config.model.embed_dim.dec_var_emb_hidden > 0:
+                config.model.embed_dim.dec_var_emb_hidden = d_model_set
+            if config.model.embed_dim.dec_pos_emb_hidden is not None and config.model.embed_dim.dec_pos_emb_hidden > 0:
+                config.model.embed_dim.dec_pos_emb_hidden = d_model_set
+            if config.model.embed_dim.dec_time_emb_hidden is not None and config.model.embed_dim.dec_time_emb_hidden > 0:
+                config.model.embed_dim.dec_time_emb_hidden = d_model_set
+            
+        elif config.model.kwargs.comps_embed_dec == "spatiotemporal":
             config.model.kwargs.d_model_dec = config.model.embed_dim.d_model_set
             
-        if config.model.kwargs.comps_embed_enc == "spatiotemporal":
-            config.model.d_model_enc = config.model.embed_dim.d_model_set
-            
-        if config.model.kwargs.comps_embed_dec == "spatiotemporal":    
-            config.model.d_model_dec = config.model.embed_dim.d_model_set
-            
-        if config.training.optimization in [3,4,5,6,7]:
-            config.model.ds_embed_enc.set.sparse_grad = True
-            
-            
-    elif config.model.model_object == "proT_sim":
-    
-        if config.model.kwargs.comps_embed_enc == "concat":
-            config.model.kwargs.d_model_enc = config.model.embed_dim.enc_val_emb_hidden + config.model.embed_dim.enc_var_emb_hidden + config.model.embed_dim.enc_pos_emb_hidden + config.model.embed_dim.enc_time_emb_hidden
-            
-        if config.model.kwargs.comps_embed_dec == "concat":    
-            config.model.kwargs.d_model_dec = config.model.embed_dim.dec_val_emb_hidden + config.model.embed_dim.dec_var_emb_hidden + config.model.embed_dim.dec_pos_emb_hidden + config.model.embed_dim.dec_time_emb_hidden
-            
-        if config.model.kwargs.comps_embed_enc == "summation":
-            config.model.kwargs.d_model_enc = config.model.embed_dim.d_model_set
-            
-        if config.model.kwargs.comps_embed_dec == "summation":
-            config.model.kwargs.d_model_dec = config.model.embed_dim.d_model_set
-            
-        if config.model.kwargs.comps_embed_enc == "spatiotemporal":
-            config.model.d_model_enc = config.model.embed_dim.d_model_set
-            
-        if config.model.kwargs.comps_embed_dec == "spatiotemporal":    
-            config.model.d_model_dec = config.model.embed_dim.d_model_set
-            
-        if config.training.optimization in [3,4,5,6,7]:
-            config.model.ds_embed_enc.set.sparse_grad = True
-            
-    
-            
-    if config.model.model_object in ["proT", "proT_adaptive"]:
-    
-        if config.model.kwargs.comps_embed_enc == "concat":
-            config.model.kwargs.d_model_enc = config.model.embed_dim.enc_val_emb_hidden + config.model.embed_dim.enc_var_emb_hidden + config.model.embed_dim.enc_pos_emb_hidden + config.model.embed_dim.enc_time_emb_hidden
-            
-        if config.model.kwargs.comps_embed_dec == "concat":    
-            config.model.kwargs.d_model_dec = config.model.embed_dim.dec_val_emb_hidden + config.model.embed_dim.dec_var_emb_hidden + config.model.embed_dim.dec_pos_emb_hidden + config.model.embed_dim.dec_time_emb_hidden + config.model.embed_dim.dec_val_given_emb_hidden
-            
-        if config.model.kwargs.comps_embed_enc == "summation":
-            config.model.kwargs.d_model_enc = config.model.embed_dim.d_model_set
-            
-        if config.model.kwargs.comps_embed_dec == "summation":
-            config.model.kwargs.d_model_dec = config.model.embed_dim.d_model_set
-            
-        if config.model.kwargs.comps_embed_enc == "spatiotemporal":
-            config.model.d_model_enc = config.model.embed_dim.d_model_set
-            
-        if config.model.kwargs.comps_embed_dec == "spatiotemporal":    
-            config.model.d_model_dec = config.model.embed_dim.d_model_set
-            
-        if config.training.optimization in [3,4,5,6,7]:
-            config.model.ds_embed_enc.set.sparse_grad = True
-            
-            
+    # Handle other model types
     elif config.model.model_object in ["GRU","LSTM", "TCN","MLP"]:
         D_in = len(config.model.kwargs.ds_embed_in.modules)
-        D_trg = len(config.model.kwargs.ds_embed_trg.modules)        
-        config.model.kwargs.d_in = D_in*config.experiment.d_model_set
-        config.model.kwargs.d_emb = D_trg*config.experiment.d_model_set
+        D_trg = len(config.model.kwargs.ds_embed_trg.modules)
+        
+        # Check composition mode
+        comps_embed = config.model.kwargs.get("comps_embed", "concat")
+        
+        if comps_embed == "summation":
+            # Summation: all embeddings sum to d_model_set dimension
+            config.model.kwargs.d_in = config.experiment.d_model_set
+            config.model.kwargs.d_emb = config.experiment.d_model_set
+        else:
+            # Concatenation (default): embeddings are concatenated
+            config.model.kwargs.d_in = D_in * config.experiment.d_model_set
+            config.model.kwargs.d_emb = D_trg * config.experiment.d_model_set
+        
     return config

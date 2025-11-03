@@ -1,6 +1,6 @@
 """
-Simple Transformer Forecaster with clean AdamW optimizer.
-This is the base forecaster with minimal complexity - suitable for most use cases.
+Simple Transformer Forecaster with Entropy Regularization.
+This forecaster extends the SimpleForecaster by adding entropy regularization to the loss function.
 """
 
 from typing import Any
@@ -12,18 +12,22 @@ import torchmetrics as tm
 from proT.core.model import ProT
 
 
-class SimpleForecaster(pl.LightningModule):
+class EntropyRegularizedForecaster(pl.LightningModule):
     """
-    Simple transformer forecaster with standard PyTorch Lightning training.
-    Uses AdamW optimizer with no complex optimization schemes.
+    Simple transformer forecaster with entropy regularization.
+    Extends SimpleForecaster by adding an entropy regularization term to encourage
+    higher entropy in attention distributions.
     
-    This is the recommended forecaster for most use cases.
+    The entropy regularization term is: gamma * (1/enc_self_entropy + 1/dec_self_entropy + 1/dec_cross_entropy)
+    This penalizes low entropy (peaked attention) and encourages more distributed attention patterns.
     
     Args:
         config: Configuration dictionary containing:
             - model.kwargs: ProT model parameters
             - training.loss_fn: Loss function name (e.g., "mse")
             - training.lr: Learning rate for AdamW
+            - training.gamma: Weight for entropy regularization (default: 1E-3)
+            - training.entropy_regularizer: Boolean flag to enable/disable entropy regularization (default: False)
             - data.val_idx: Index of value feature in target tensor
     """
     
@@ -41,6 +45,10 @@ class SimpleForecaster(pl.LightningModule):
         
         # Data indices
         self.dec_val_idx = config["data"]["val_idx"]
+        
+        # Entropy regularization parameters
+        self.gamma = config["training"].get("gamma", 1E-3)
+        self.entropy_regularizer = config["training"].get("entropy_regularizer", False)
         
         # Save hyperparameters
         self.save_hyperparameters(config)
@@ -76,7 +84,7 @@ class SimpleForecaster(pl.LightningModule):
     
     def _step(self, batch, stage: str = None):
         """
-        Common step for train/val/test.
+        Common step for train/val/test with entropy regularization.
         
         Args:
             batch: Tuple of (input_data, target_data)
@@ -98,16 +106,30 @@ class SimpleForecaster(pl.LightningModule):
         mse_per_elem = self.loss_fn(predicted_value, trg)
         loss = mse_per_elem.mean()
         
+        # Calculate entropy statistics
+        enc_self = torch.concat(enc_self_ent, dim=0).mean()
+        dec_self = torch.concat(dec_self_ent, dim=0).mean()
+        dec_cross = torch.concat(dec_cross_ent, dim=0).mean()
+        
+        # Apply entropy regularization if enabled
+        if self.entropy_regularizer:
+            # Protect against NaN and division by zero
+            ent_regularizer = 0.0
+            if not torch.isnan(enc_self) and enc_self > 1e-8:
+                ent_regularizer += 1.0/enc_self
+            if not torch.isnan(dec_self) and dec_self > 1e-8:
+                ent_regularizer += 1.0/dec_self
+            if not torch.isnan(dec_cross) and dec_cross > 1e-8:
+                ent_regularizer += 1.0/dec_cross
+            
+            loss = loss + self.gamma * ent_regularizer
+        
         # Log metrics
         for name, metric in [("mae", self.mae), ("rmse", self.rmse), ("r2", self.r2)]:
             metric_eval = metric(predicted_value.reshape(-1), trg.reshape(-1))
             self.log(f"{stage}_{name}", metric_eval, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
         
         # Log entropy statistics
-        enc_self = torch.concat(enc_self_ent, dim=0).mean()
-        dec_self = torch.concat(dec_self_ent, dim=0).mean()
-        dec_cross = torch.concat(dec_cross_ent, dim=0).mean()
-        
         for name, value in [("enc_self_entropy", enc_self), ("dec_self_entropy", dec_self), ("dec_cross_entropy", dec_cross)]:
             self.log(f"{stage}_{name}", value, on_step=False, on_epoch=True, prog_bar=False)
         

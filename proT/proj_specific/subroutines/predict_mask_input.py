@@ -1,10 +1,11 @@
-from os.path import dirname, abspath, join,exists
+from os.path import dirname, abspath, join, exists
+import os
 import sys
 
 ROOT_DIR = dirname(dirname(dirname(abspath(__file__))))
 sys.path.append(ROOT_DIR)
 
-from proT.subroutines.sub_utils import *
+from proT.proj_specific.subroutines.sub_utils import *
 from proT.labels import *
 
 
@@ -26,7 +27,8 @@ def predict_mask_input(
     assert exists(EXP_DIR), f"Folder does not exist: {EXP_DIR}"
     SUB_DIR = join(EXP_DIR, "sub", sub_id)
     output_path = join(SUB_DIR, "output")
-    mk_missing_folders([SUB_DIR,output_path])
+    os.makedirs(SUB_DIR, exist_ok=True)
+    os.makedirs(output_path, exist_ok=True)
     
     # dataset
     dm = load_dataset(exp_id=exp_id)

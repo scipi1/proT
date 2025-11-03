@@ -5,6 +5,7 @@ import torchmetrics as tm
 from os.path import dirname, abspath, join
 import sys
 from os.path import abspath, join
+from typing import Tuple
 ROOT_DIR = dirname(dirname(abspath(__file__)))
 sys.path.append(ROOT_DIR)
 from proT.baseline.baseline_models import RNN, TCN, MLP
@@ -45,7 +46,7 @@ class RNNForecaster(pl.LightningModule):
         return self.model(x, y, **kwargs)
     
     
-    def _step(self, batch, stage: str=None):
+    def _step(self, batch: Tuple[torch.Tensor], stage: str=None):
         
         X, Y = batch
         
@@ -54,7 +55,6 @@ class RNNForecaster(pl.LightningModule):
         # extract target features and zero the value
         masked_target = Y.clone()
         masked_target[:,:,self.val_idx] = 0
-        
         predict_out = self.forward(x=input_tensor, y=masked_target)
         
         trg = torch.nan_to_num(Y[:,:,self.val_idx])

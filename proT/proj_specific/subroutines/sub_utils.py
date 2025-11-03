@@ -1,11 +1,8 @@
 import numpy as np
 import pandas as pd
 import torch
-import random
-from datetime import datetime
 import pytorch_lightning as pl
-from os.path import dirname, abspath, join,exists
-from os import makedirs
+from os.path import dirname, abspath, join, exists
 import sys
 from typing import List
 
@@ -13,7 +10,8 @@ from proT.training.forecasters.transformer_forecaster import TransformerForecast
 from proT.training.dataloader import ProcessDataModule
 from proT.evaluation.predict import predict
 from proT.labels import *
-from proT.old_.config import load_config
+from proT.core.modules.utils import mk_fname
+from omegaconf import OmegaConf
 
 
 # # enforce deterministic behavior
@@ -22,20 +20,6 @@ from proT.old_.config import load_config
 # random.seed(42)
 # torch.backends.cudnn.deterministic = True
 # torch.backends.cudnn.benchmark = False
-
-
-def mk_missing_folders(folders):
-    for folder in folders:
-        if not exists(folder):
-            makedirs(folder)
-            print(f"Created folder: {folder}")
-
-
-
-def mk_fname(filename: str,label: str,suffix: str):
-    now = datetime.now()
-    timestamp = now.strftime("%Y%m%d_%H%M%S") # format YYYYMMDD_HHMMSS
-    return filename+"_"+str(label)+f"_{timestamp}"+suffix
 
 
 
@@ -65,10 +49,10 @@ def load_model(exp_id: str, checkpoint: str, standard_path: bool=True):
         _, _, _, EXPERIMENTS_DIR = get_dirs(ROOT_DIR)
         EXP_DIR = join(EXPERIMENTS_DIR, exp_id)
         checkpoint_path = join(EXP_DIR, "checkpoints", checkpoint)
-        config = load_config(EXP_DIR)
+        config = OmegaConf.load(join(EXP_DIR, "config.yaml"))
     else:
         checkpoint_path = checkpoint
-        config = load_config(exp_id)
+        config = OmegaConf.load(join(exp_id, "config.yaml"))
 
     model = TransformerForecaster(config)
     model_resumed = model.load_from_checkpoint(checkpoint_path)
@@ -84,9 +68,9 @@ def load_dataset(exp_id: str, standard_path: bool = True):
         ROOT_DIR = dirname(dirname(dirname(abspath(__file__))))
         INPUT_DIR, _, _, EXPERIMENTS_DIR = get_dirs(ROOT_DIR)
         EXP_DIR = join(EXPERIMENTS_DIR, exp_id)
-        config = load_config(EXP_DIR)
+        config = OmegaConf.load(join(EXP_DIR, "config.yaml"))
     else:
-        config = load_config(exp_id)
+        config = OmegaConf.load(join(exp_id, "config.yaml"))
 
     dm = ProcessDataModule(
         ds_flag=config["data"]["ds_flag"],
@@ -142,7 +126,7 @@ def get_masks_from_template(template_path=None,exp_id=None):
         ROOT_DIR = dirname(dirname(dirname(abspath(__file__))))
         INPUT_DIR,_,_,EXPERIMENTS_DIR = get_dirs(ROOT_DIR)
         EXP_DIR = join(EXPERIMENTS_DIR,exp_id)
-        config = load_config(EXP_DIR)
+        config = OmegaConf.load(join(EXP_DIR, "config.yaml"))
         dataset = config["data"]["dataset"]
         template_path = join(INPUT_DIR,dataset,"templates.csv")
 

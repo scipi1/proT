@@ -12,73 +12,18 @@ import pytest
 import os
 import tempfile
 import shutil
-from pathlib import Path
 from omegaconf import OmegaConf
 import pandas as pd
 
 from proT.training.trainer import trainer
 from proT.training.experiment_control import update_config
 
-# Constants
-ROOT_DIR = Path(__file__).parent.parent
-PROTOCOL_DIR = ROOT_DIR / "experiments" / "training" / "tests" / "protocol"
-DATA_DIR = ROOT_DIR / "data" / "input"
-
-
-def discover_protocol_configs():
-    """
-    Auto-discover all config files in protocol experiment folders.
-    
-    Returns:
-        list: List of pytest.param objects with custom IDs for clean display
-    """
-    configs = []
-    
-    if not PROTOCOL_DIR.exists():
-        pytest.skip(f"Protocol directory not found: {PROTOCOL_DIR}")
-        return configs
-    
-    # Walk through protocol directory
-    for experiment_dir in PROTOCOL_DIR.iterdir():
-        if experiment_dir.is_dir():
-            # Look for config files in each experiment directory
-            for config_file in experiment_dir.glob("config*.yaml"):
-                # Use only the experiment folder name for cleaner test output
-                experiment_name = experiment_dir.name
-                # Use pytest.param with id to control display name
-                configs.append(pytest.param(experiment_name, str(config_file), id=experiment_name))
-    
-    if not configs:
-        pytest.skip("No protocol experiment configs found")
-    
-    return configs
-
-
-def modify_config_for_dev_mode(config):
-    """
-    Override config parameters for fast dev mode testing.
-    
-    Args:
-        config: OmegaConf config object
-        
-    Returns:
-        OmegaConf: Modified config for dev mode
-    """
-    # Make a copy to avoid modifying original
-    config_dev = config.copy()
-    
-    # Override training parameters for speed
-    config_dev["training"]["max_epochs"] = 1
-    config_dev["training"]["save_ckpt_every_n_epochs"] = 999  # Disable checkpointing
-    
-    # Limit data size for fast execution
-    config_dev["data"]["max_data_size"] = 10
-    
-    # Disable test_ds_idx to avoid index out of bounds with limited dataset
-    # The trainer will use random splits instead
-    config_dev["data"]["test_ds_ixd"] = None
-    
-    return config_dev
+# Import shared test utilities
+from .utils import (
+    discover_protocol_configs,
+    modify_config_for_fast_testing,
+    DATA_DIR
+)
 
 
 @pytest.fixture
@@ -115,7 +60,7 @@ def test_protocol_experiment_compatibility(experiment_name, config_path, temp_ou
     config = OmegaConf.load(config_path)
     
     # 2. Modify for dev mode (fast execution)
-    config_dev = modify_config_for_dev_mode(config)
+    config_dev = modify_config_for_fast_testing(config, max_epochs=1)
     
     # 3. Update config (handle placeholders, etc.)
     config_updated = update_config(config_dev)
@@ -148,7 +93,7 @@ def test_protocol_experiment_compatibility(experiment_name, config_path, temp_ou
 
 
 # Optional: Mark tests as slow for CI filtering
-pytestmark = pytest.mark.integration
+# pytestmark = pytest.mark.integration
 
 
 if __name__ == "__main__":
@@ -159,8 +104,8 @@ if __name__ == "__main__":
     # Discover and print available experiments
     configs = discover_protocol_configs()
     print(f"\nFound {len(configs)} protocol experiments:")
-    for name, path in configs:
-        print(f"  - {name}")
+    for param in configs:
+        print(f"  - {param.id}")
     
     # Run pytest
     pytest.main([__file__, "-v", "-s"])
