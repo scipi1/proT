@@ -8,7 +8,7 @@ from os.path import abspath, join
 from typing import Tuple
 ROOT_DIR = dirname(dirname(abspath(__file__)))
 sys.path.append(ROOT_DIR)
-from proT.baseline.baseline_models import RNN, TCN, MLP
+from proT.baseline.baseline_models import RNN, TCN, MLP, S6
 
 
 class RNNForecaster(pl.LightningModule):
@@ -28,6 +28,8 @@ class RNNForecaster(pl.LightningModule):
         elif config["model"]["model_object"] == "MLP":
             self.model = MLP(**config["model"]["kwargs"])
         
+        elif config["model"]["model_object"] == "S6":
+            self.model = S6(**config["model"]["kwargs"])
         
         
         # define loss
@@ -112,5 +114,3 @@ class RNNForecaster(pl.LightningModule):
             }
 
         return opt
-
-        

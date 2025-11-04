@@ -279,7 +279,7 @@ def update_config(config: dict)->dict:
         dict: updated config
     """
     
-    assert config.model.model_object in ["proT", "proT_sim", "proT_adaptive", "GRU","LSTM", "TCN","MLP"], \
+    assert config.model.model_object in ["proT", "proT_sim", "proT_adaptive", "GRU","LSTM", "TCN","MLP", "S6"], \
         AssertionError("This model is not available in experiment_control!")
     
     # Handle all proT variants (proT, proT_sim, proT_adaptive) with unified logic
@@ -344,7 +344,7 @@ def update_config(config: dict)->dict:
             config.model.kwargs.d_model_dec = config.model.embed_dim.d_model_set
             
     # Handle other model types
-    elif config.model.model_object in ["GRU","LSTM", "TCN","MLP"]:
+    elif config.model.model_object in ["GRU","LSTM", "TCN","MLP", "S6"]:
         D_in = len(config.model.kwargs.ds_embed_in.modules)
         D_trg = len(config.model.kwargs.ds_embed_trg.modules)
         

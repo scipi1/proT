@@ -5,6 +5,7 @@ from os.path import abspath, join
 ROOT_DIR = dirname(dirname(abspath(__file__)))
 sys.path.append(ROOT_DIR)
 from proT.core.modules.embedding import ModularEmbedding
+from proT.baseline.s6 import BiMamba
 
 
 
@@ -212,3 +213,70 @@ class MLP(nn.Module):
         
         return out
 
+
+
+class S6(nn.Module):
+    def __init__(
+        self,
+        model: str,
+        d_in: int,           # input embedding dim
+        d_emb: int,          # target embedding dim
+        d_model: int,        # Mamba hidden dimension
+        n_layers: int,       # number of Mamba layers
+        dropout: float,
+        comps_embed: str,
+        ds_embed_in: dict,
+        ds_embed_trg: dict,
+        d_state: int = 16,   # SSM state dimension (paper default)
+        d_conv: int = 4,     # convolution kernel size (paper default)
+        expand: int = 2,     # expansion factor (paper default)
+        d_out: int = 1
+        ):
+        super().__init__()
+        
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        self.input_embedding  = ModularEmbedding(
+            ds_embed=ds_embed_in,  
+            comps=comps_embed, 
+            device=device)
+        
+        self.target_embedding = ModularEmbedding(
+            ds_embed=ds_embed_trg, 
+            comps=comps_embed, 
+            device=device)
+        
+        # bidirectional Mamba model
+        self.bimamba = BiMamba(
+            d_model=d_in,        # input embedding dimension
+            n_layers=n_layers,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            dropout=dropout
+        )
+        
+        # final projection layer
+        # BiMamba outputs d_model*2 due to bidirectionality
+        self.head = nn.Linear(d_in * 2 + d_emb, d_out)
+    
+    def forward(self, X, y):
+        
+        # input and target embeddings
+        X = self.input_embedding(X)                         # B × L_in × d_in_emb
+        yemb = self.target_embedding(y)                     # B × L_out × d_emb
+        _, L_out, _ = yemb.shape
+        
+        # BiMamba forward pass with mean pooling
+        ctx = self.bimamba.get_context(X)                   # B × (d_in*2)
+        
+        # expand context to match the target embeddings
+        ctx_exp = ctx.unsqueeze(1).expand(-1, L_out, -1)    # B × L_out × (d_in*2)
+        
+        # concatenate target embeddings with context
+        z = torch.cat([yemb, ctx_exp], -1)                  # B × L_out × (d_emb+d_in*2)
+        
+        # final projection
+        out = self.head(z).squeeze(-1)
+        
+        return out

@@ -280,18 +280,22 @@ def get_model_object(config: dict)->pl.LightningModule:
     
     model_obj = config["model"]["model_object"]
     available_models = ["proT", "proT_sim", "proT_adaptive", 
-                        "LSTM", "GRU", "TCN", "MLP"]
+                        "LSTM", "GRU", "TCN", "MLP", "S6"]
     
     assert model_obj in available_models, AssertionError(f"{model_obj} unavailable! Choose between {available_models}")
 
     MODEL_REGISTRY = {
-    "proT"          : EntropyRegularizedForecaster,
-    "proT_sim"      : SimulatorForecaster,
-    "proT_adaptive" : OnlineTargetForecaster,
-    "GRU"           : RNNForecaster,
-    "LSTM"          : RNNForecaster,
-    "TCN"           : RNNForecaster,
-    "MLP"           : RNNForecaster,
+        # PRO-T
+        "proT"          : EntropyRegularizedForecaster,
+        "proT_sim"      : SimulatorForecaster,
+        "proT_adaptive" : OnlineTargetForecaster,
+
+        # BASELINE MODELS
+        "GRU"           : RNNForecaster,
+        "LSTM"          : RNNForecaster,
+        "TCN"           : RNNForecaster,
+        "MLP"           : RNNForecaster,
+        "S6"            : RNNForecaster,
     }
     return MODEL_REGISTRY[model_obj]
 
@@ -308,7 +312,7 @@ if __name__ == "__main__":
     import re
     
     ROOT_DIR = dirname(dirname(dirname(abspath(__file__))))
-    exp_dir = join(ROOT_DIR, "experiments/baseline_optuna/baseline_proT_ishigami_sum")
+    exp_dir = join(ROOT_DIR, "experiments/baseline_optuna/baseline_S6_ishigami_sum")
     data_dir = join(ROOT_DIR, "data/input/")
     
     # look for config file
