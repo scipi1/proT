@@ -338,7 +338,6 @@ def train_function_for_optuna(
     """
     # Update config (proT-specific preprocessing)
     config_updated = update_config(config)
-    
     # Call proT's trainer
     df_metric = trainer(
         config=config_updated,

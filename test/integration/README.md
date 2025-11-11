@@ -47,6 +47,38 @@ pytest proT/test/test_optuna_compatibility.py::test_optuna_workflow_compatibilit
 pytest proT/test/ -v -m "not slow"
 ```
 
+### `test_sweep_compatibility.py`
+Tests that the euler_sweep framework works correctly with protocol experiments.
+
+**Purpose:**
+- Validates sweep framework integration (model-agnostic)
+- Tests both sweep modes: independent and combination
+- Ensures sequential sweep execution works correctly
+- Verifies directory structure and result validation
+
+**Features:**
+- ✅ Tests both independent and combination sweep modes
+- ✅ Configurable protocol via CLI (default: test_baseline_proT_ishigami_cat)
+- ✅ Minimal parameter combinations (2 values per param)
+- ✅ Automatic skip for excessive combinations
+- ✅ Windows-compatible cleanup
+
+**Usage:**
+```bash
+# Run all sweep compatibility tests (both modes)
+pytest proT/test/test_sweep_compatibility.py -v -s
+
+# Run specific sweep mode
+pytest proT/test/test_sweep_compatibility.py::test_sweep_workflow_compatibility[independent] -v -s
+pytest proT/test/test_sweep_compatibility.py::test_sweep_workflow_compatibility[combination] -v -s
+
+# Test with different protocol
+pytest proT/test/test_sweep_compatibility.py --protocol=test_baseline_MLP_ishigami_sum -v -s
+
+# Skip slow tests
+pytest proT/test/ -v -m "not slow"
+```
+
 ### `utils.py`
 Shared utilities for test files.
 
@@ -61,13 +93,15 @@ The test suite covers all proT model variants:
 
 | Model Type | Test Coverage |
 |------------|---------------|
-| **proT** | ✅ Protocol + Optuna |
-| **proT_sim** | ✅ Protocol + Optuna |
-| **proT_adaptive** | ✅ Protocol + Optuna |
-| **MLP** | ✅ Protocol + Optuna |
-| **LSTM** | ✅ Protocol + Optuna |
-| **GRU** | ✅ Protocol + Optuna |
-| **TCN** | ✅ Protocol + Optuna |
+| **proT** | ✅ Protocol + Optuna + Sweep |
+| **proT_sim** | ✅ Protocol + Optuna + Sweep |
+| **proT_adaptive** | ✅ Protocol + Optuna + Sweep |
+| **MLP** | ✅ Protocol + Optuna + Sweep |
+| **LSTM** | ✅ Protocol + Optuna + Sweep |
+| **GRU** | ✅ Protocol + Optuna + Sweep |
+| **TCN** | ✅ Protocol + Optuna + Sweep |
+
+**Note:** The sweep test is model-agnostic (unlike Optuna which has model-specific sampling). One protocol test validates the sweep framework works for all models.
 
 ## Running Tests
 

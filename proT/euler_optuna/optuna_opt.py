@@ -31,7 +31,7 @@ sys.path.append(ROOT_DIR)
 # =============================================================================
 # Example:
 # from your_project.trainer import trainer
-# from your_project.experiment_control import update_config
+from proT.training.experiment_control import update_config
 
 
 # =============================================================================
@@ -225,9 +225,9 @@ def objective_extended(
     # Create trial-specific config
     config_path, save_dir = get_config_run(config, exp_path, params, trial.number)
     
-    # Load and update run config (if you have a config update function)
+    # Load and update run config
     config_run = OmegaConf.load(config_path)
-    # config_updated = update_config(config_run)  # CUSTOMIZE: Uncomment if needed
+    # config_updated = update_config(config_run)  # Apply proT-specific preprocessing
     
     # Set CUDA device if on cluster
     if cluster and torch.cuda.is_available():
@@ -236,7 +236,7 @@ def objective_extended(
     # Train model
     try:
         train_results = train_function(
-            config=config_run,
+            config=config_run,  # Use the updated config
             data_dir=data_dir,
             save_dir=save_dir,
             experiment_tag=experiment_tag,
@@ -363,7 +363,7 @@ class OptunaStudy:
         
         # Set study parameters
         self.storage = f"sqlite:///{self.study_file_path}?timeout=60"
-        self.max_trials = self._setting("n_trials", 50)
+        self.max_trials = self._setting("n_trials", 20)
         self.direction = self._setting("direction", optimization_direction)
         self.pruner = self._setting("pruner", "none")
         
@@ -377,8 +377,10 @@ class OptunaStudy:
                 pruner=self._build_pruner(),
                 storage=self.storage,
             )
+            # Store trial limit from optuna.yaml as study metadata for parallel workers
+            study.set_user_attr("n_trials_total", self.max_trials)
             print(f"Created study '{self.study_name}' stored at {self.storage}")
-            print(f"Study will run {self.max_trials} trials")
+            print(f"Study will run {self.max_trials} trials (stored in study metadata)")
             print(f"Optimizing '{self.optimization_metric}' ({self.direction})")
             
         except DuplicatedStudyError:

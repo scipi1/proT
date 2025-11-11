@@ -40,7 +40,7 @@ def train(exp_id, debug, cluster, exp_tag, scratch_path, resume_checkpoint, plot
     print(scratch_path)
     
     if scratch_path is None:
-        exp_dir = join(ROOT_DIR, "experiments/training", exp_id)
+        exp_dir = join(ROOT_DIR, "experiments/", exp_id)
     else:
         exp_dir = join(scratch_path)
         

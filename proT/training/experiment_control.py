@@ -279,8 +279,7 @@ def update_config(config: dict)->dict:
         dict: updated config
     """
     
-    assert config.model.model_object in ["proT", "proT_sim", "proT_adaptive", "GRU","LSTM", "TCN","MLP", "S6"], \
-        AssertionError("This model is not available in experiment_control!")
+    assert config.model.model_object in ["proT", "proT_sim", "proT_adaptive", "GRU","LSTM", "TCN","MLP", "S6"], AssertionError("This model is not available in experiment_control!")
     
     # Handle all proT variants (proT, proT_sim, proT_adaptive) with unified logic
     if config.model.model_object in ["proT", "proT_sim", "proT_adaptive"]:

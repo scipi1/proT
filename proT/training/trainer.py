@@ -63,7 +63,6 @@ def trainer(
     Returns:
         pd.DataFrame: DataFrame containing metrics for each fold
     """
-    
     # set logging
     logger_info = logging.getLogger("logger_info")
     
