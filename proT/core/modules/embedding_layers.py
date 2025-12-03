@@ -9,7 +9,7 @@ class Time2Vec(nn.Module):
     def __init__(self, input_dim:int, embed_dim:int, device):
         super(Time2Vec, self).__init__()
         activation = torch.sin
-        assert embed_dim % input_dim == 0
+        assert embed_dim % input_dim == 0, AssertionError(f"Problems with Time2Vec embedding. Choose a multiple of {input_dim}!")
         
         self.embed_dim = embed_dim // input_dim # so that the final dimension is embed_dim
         self.input_dim = input_dim

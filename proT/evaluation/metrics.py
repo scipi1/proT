@@ -295,8 +295,14 @@ def compute_prediction_metrics(
             if 'r2' in metrics and 'r2' not in metric_vals:
                 metric_vals['r2'] = torch.full((D,), float('nan'))
         
-        # Convert to lists
-        metric_lists = {name: val.tolist() for name, val in metric_vals.items()}
+        # Convert to lists - ensure all values are lists, even for scalar tensors
+        metric_lists = {}
+        for name, val in metric_vals.items():
+            val_list = val.tolist()
+            # If tolist() returns a scalar (0D tensor), wrap it in a list
+            if not isinstance(val_list, list):
+                val_list = [val_list]
+            metric_lists[name] = val_list
         
         # Build rows
         if D > 1 and labels is not None:
@@ -371,7 +377,14 @@ def _compute_global_metrics(
     
     # Build rows
     rows = []
-    metric_lists = {name: val.tolist() for name, val in metric_vals.items()}
+    # Ensure all values are lists, even for scalar tensors
+    metric_lists = {}
+    for name, val in metric_vals.items():
+        val_list = val.tolist()
+        # If tolist() returns a scalar (0D tensor), wrap it in a list
+        if not isinstance(val_list, list):
+            val_list = [val_list]
+        metric_lists[name] = val_list
     
     if D > 1 and labels is not None:
         for d, feature_name in enumerate(labels):

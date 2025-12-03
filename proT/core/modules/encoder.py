@@ -54,7 +54,9 @@ class EncoderLayer(nn.Module):
         
         # uses pre-norm Transformer architecture
         
-        X1 = self.norm1(X, ~mask_miss_q)
+        not_mask_miss_q = ~mask_miss_q if mask_miss_q is not None else None
+        
+        X1 = self.norm1(X, not_mask_miss_q)
         
         
         # self-attention queries=keys=values=X
@@ -71,7 +73,7 @@ class EncoderLayer(nn.Module):
         # resnet
         X = X + self.dropout_attn_out(X1)
         
-        X1 = self.norm2(X, ~mask_miss_q)
+        X1 = self.norm2(X, not_mask_miss_q)
         
         
         # feedforward layers (done here as 1x1 convs)
@@ -125,6 +127,7 @@ class Encoder(nn.Module):
             ent_list.append(ent)
             
         if self.norm_layer is not None:
-            X = self.norm_layer(X, ~mask_miss_q)
+            not_mask_miss_q = ~mask_miss_q if mask_miss_q is not None else None
+            X = self.norm_layer(X, not_mask_miss_q)
 
         return X, attn_list, ent_list

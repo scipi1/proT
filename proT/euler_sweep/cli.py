@@ -92,7 +92,7 @@ def train_function_for_sweep(
         cluster=cluster,
         experiment_tag=experiment_tag,
         resume_ckpt=None,
-        plot_pred_check=False,
+        plot_pred_check=True,
         debug=False
     )
     

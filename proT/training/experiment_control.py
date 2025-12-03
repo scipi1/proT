@@ -50,7 +50,7 @@ def find_yml_files(dir:str)-> Tuple[dict]:
 
 
 
-
+# TODO: can be deleted now
 def combination_sweep(exp_dir, mode="combination"):
     """
     This function scans for configuration files in a folder and runs accordingly
@@ -248,6 +248,9 @@ def calculate_concat_dim(config, embed_prefix: str, modules_path: str) -> int:
     
     # Map embedding labels to their dimension keys in config
     label_to_dim = {
+        "process": f"{embed_prefix}_pro_emb_hidden",
+        "occurrence": f"{embed_prefix}_occ_emb_hidden",
+        "step": f"{embed_prefix}_step_emb_hidden",
         "value": f"{embed_prefix}_val_emb_hidden",
         "variable": f"{embed_prefix}_var_emb_hidden", 
         "position": f"{embed_prefix}_pos_emb_hidden",
@@ -301,14 +304,19 @@ def update_config(config: dict)->dict:
             # Set model dimension
             config.model.kwargs.d_model_enc = d_model_set
             # Update all encoder embedding dimensions to match d_model_set for summation
-            if config.model.embed_dim.enc_val_emb_hidden is not None and config.model.embed_dim.enc_val_emb_hidden > 0:
-                config.model.embed_dim.enc_val_emb_hidden = d_model_set
-            if config.model.embed_dim.enc_var_emb_hidden is not None and config.model.embed_dim.enc_var_emb_hidden > 0:
-                config.model.embed_dim.enc_var_emb_hidden = d_model_set
-            if config.model.embed_dim.enc_pos_emb_hidden is not None and config.model.embed_dim.enc_pos_emb_hidden > 0:
-                config.model.embed_dim.enc_pos_emb_hidden = d_model_set
-            if config.model.embed_dim.enc_time_emb_hidden is not None and config.model.embed_dim.enc_time_emb_hidden > 0:
-                config.model.embed_dim.enc_time_emb_hidden = d_model_set
+            encoder_embedding_keys = [
+                "enc_pro_emb_hidden",
+                "enc_occ_emb_hidden",
+                "enc_step_emb_hidden",
+                "enc_val_emb_hidden",
+                "enc_var_emb_hidden",
+                "enc_pos_emb_hidden",
+                "enc_time_emb_hidden"
+            ]
+            for key in encoder_embedding_keys:
+                current_value = OmegaConf.select(config, f"model.embed_dim.{key}")
+                if current_value is not None and current_value > 0:
+                    OmegaConf.update(config, f"model.embed_dim.{key}", d_model_set)
             
         elif config.model.kwargs.comps_embed_enc == "spatiotemporal":
             config.model.kwargs.d_model_enc = config.model.embed_dim.d_model_set
@@ -330,14 +338,16 @@ def update_config(config: dict)->dict:
             # Set model dimension
             config.model.kwargs.d_model_dec = d_model_set
             # Update all decoder embedding dimensions to match d_model_set for summation
-            if config.model.embed_dim.dec_val_emb_hidden is not None and config.model.embed_dim.dec_val_emb_hidden > 0:
-                config.model.embed_dim.dec_val_emb_hidden = d_model_set
-            if config.model.embed_dim.dec_var_emb_hidden is not None and config.model.embed_dim.dec_var_emb_hidden > 0:
-                config.model.embed_dim.dec_var_emb_hidden = d_model_set
-            if config.model.embed_dim.dec_pos_emb_hidden is not None and config.model.embed_dim.dec_pos_emb_hidden > 0:
-                config.model.embed_dim.dec_pos_emb_hidden = d_model_set
-            if config.model.embed_dim.dec_time_emb_hidden is not None and config.model.embed_dim.dec_time_emb_hidden > 0:
-                config.model.embed_dim.dec_time_emb_hidden = d_model_set
+            decoder_embedding_keys = [
+                "dec_val_emb_hidden",
+                "dec_var_emb_hidden",
+                "dec_pos_emb_hidden",
+                "dec_time_emb_hidden"
+            ]
+            for key in decoder_embedding_keys:
+                current_value = OmegaConf.select(config, f"model.embed_dim.{key}")
+                if current_value is not None and current_value > 0:
+                    OmegaConf.update(config, f"model.embed_dim.{key}", d_model_set)
             
         elif config.model.kwargs.comps_embed_dec == "spatiotemporal":
             config.model.kwargs.d_model_dec = config.model.embed_dim.d_model_set
@@ -358,5 +368,4 @@ def update_config(config: dict)->dict:
             # Concatenation (default): embeddings are concatenated
             config.model.kwargs.d_in = D_in * config.experiment.d_model_set
             config.model.kwargs.d_emb = D_trg * config.experiment.d_model_set
-        
     return config

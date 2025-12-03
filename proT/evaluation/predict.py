@@ -262,83 +262,159 @@ def predict_test_from_ckpt_adaptive(
 
 
 def mk_quick_pred_plot(
-    model: pl.LightningModule, 
-    dm: pl.LightningDataModule, 
+    config: dict,
+    checkpoint_path: Path,
+    datadir_path: Path,
     val_idx: int, 
     save_dir: Path
 ):
     """
     Create quick prediction plots for visualization.
     
-    Note: This function works with the old API for backward compatibility.
-    It creates a temporary predictor-like wrapper around the model.
+    Works with both transformer models (proT) and baseline models (LSTM, GRU, TCN, MLP, S6).
+    Uses the predictor infrastructure to automatically handle different model types.
     
     Args:
-        model: PyTorch Lightning model
-        dm: Data module
+        config: Configuration dictionary
+        checkpoint_path: Path to model checkpoint
+        datadir_path: Path to data directory
         val_idx: Index of value feature to plot
         save_dir: Directory to save plots
     """
-    # Use the old predict function for this utility
-    input_array, output_array, target_array, cross_att_array, _, _ = predict(
-        model=model, 
-        dm=dm, 
-        dataset_label="test"
+    # Use the predictor infrastructure which handles all model types
+    results = predict_test_from_ckpt(
+        config=config,
+        datadir_path=datadir_path,
+        checkpoint_path=checkpoint_path,
+        dataset_label="test",
+        cluster=False
     )
     
-    # in case we have only one sample
+    # Extract data from PredictionResult
+    input_array = results.inputs
+    output_array = results.outputs
+    target_array = results.targets
+    attention_weights = results.attention_weights
+    model_type = results.metadata.get('model_type', 'unknown')
+    
+    # Debug: Print original shapes
+    print(f"[DEBUG] Original shapes - output: {output_array.shape}, target: {target_array.shape}, input: {input_array.shape}")
+    
+    # Normalize array dimensions to ensure consistent shape handling
+    # Expected shapes: output (B, L), target (B, L, F), input (B, L, F)
+    
+    # Handle output array
     if len(output_array.shape) == 1:
-        output_array = np.expand_dims(output_array, axis=0)
-        target_array = np.expand_dims(target_array, axis=0)
-        cross_att_array = np.expand_dims(cross_att_array, axis=0)
-        input_array = np.expand_dims(input_array, axis=0)
+        output_array = output_array[np.newaxis, :]  # (L,) -> (1, L)
+    elif len(output_array.shape) == 0:
+        raise ValueError(f"Output array has invalid shape: {output_array.shape}")
     
-    y_out = output_array[0, :]
-    y_trg = target_array[0, :, val_idx]
-    cross_att = cross_att_array[0]
-    input_miss_bool = np.isnan(input_array[0, :, val_idx].squeeze())
-    input_miss = input_miss_bool[np.newaxis, :].astype(int)
+    # Handle target array - this is the critical part
+    if len(target_array.shape) == 1:
+        # (L,) -> need to add batch and feature dims
+        target_array = target_array[np.newaxis, :, np.newaxis]
+    elif len(target_array.shape) == 2:
+        # Could be (B, L) or (L, F) - need to determine which
+        # If second dim matches output length, it's likely (L, F)
+        if target_array.shape[0] == output_array.shape[1]:
+            # (L, F) -> (1, L, F)
+            target_array = target_array[np.newaxis, :, :]
+        else:
+            # (B, L) -> (B, L, 1)
+            target_array = target_array[:, :, np.newaxis]
+    elif len(target_array.shape) == 3:
+        # Already correct shape (B, L, F)
+        pass
+    else:
+        raise ValueError(f"Target array has unexpected shape: {target_array.shape}")
     
-    N, M = cross_att.shape
-    assert len(y_out) == len(y_trg)
+    # Handle input array
+    if len(input_array.shape) == 1:
+        input_array = input_array[np.newaxis, :, np.newaxis]
+    elif len(input_array.shape) == 2:
+        if input_array.shape[0] == output_array.shape[1]:
+            input_array = input_array[np.newaxis, :, :]
+        else:
+            input_array = input_array[:, :, np.newaxis]
+    
+    # Debug: Print normalized shapes
+    print(f"[DEBUG] Normalized shapes - output: {output_array.shape}, target: {target_array.shape}, input: {input_array.shape}")
+    
+    # Extract first sample for plotting
+    y_out = output_array[0, :]  # Shape: (L,)
+    
+    # Safely extract target values for the specified feature
+    if target_array.shape[2] <= val_idx:
+        raise ValueError(f"val_idx={val_idx} is out of bounds for target array with {target_array.shape[2]} features")
+    
+    y_trg = target_array[0, :, val_idx]  # Shape: (L,)
+    
+    print(f"[DEBUG] Extracted y_out shape: {y_out.shape}, y_trg shape: {y_trg.shape}")
+    print(f"[DEBUG] y_out range: [{y_out.min():.2f}, {y_out.max():.2f}], y_trg range: [{y_trg.min():.2f}, {y_trg.max():.2f}]")
+    
     x = np.arange(len(y_out))
 
+    # Plot 1: Prediction vs Target (always created)
     fig, ax = plt.subplots()
-    ax.plot(x, y_out)
-    ax.plot(x, y_trg)
+    ax.plot(x, y_out, label='Prediction')
+    ax.plot(x, y_trg, label='Target')
+    ax.set_xlabel('Time Step')
+    ax.set_ylabel('Value')
+    ax.set_title('Predictions vs Targets')
+    ax.legend()
     fig.savefig(join(save_dir, "quick_pred_plot.png"))
+    plt.close(fig)
+    print(f"Saved prediction plot to {join(save_dir, 'quick_pred_plot.png')}")
     
-    # Create figure and grid
-    fig2 = plt.figure(figsize=(6, 5))
-    gs = gridspec.GridSpec(2, 1, height_ratios=[10, 1], hspace=0.5)
+    # Plot 2: Attention Heatmap (only for transformer models)
+    if attention_weights is not None and 'cross' in attention_weights:
+        cross_att_array = attention_weights['cross']
+        
+        # Handle dimensions
+        if len(cross_att_array.shape) == 2:
+            cross_att_array = np.expand_dims(cross_att_array, axis=0)
+        
+        cross_att = cross_att_array[0]
+        input_miss_bool = np.isnan(input_array[0, :, val_idx].squeeze())
+        input_miss = input_miss_bool[np.newaxis, :].astype(int)
+        
+        N, M = cross_att.shape
+        
+        # Create figure and grid
+        fig2 = plt.figure(figsize=(6, 5))
+        gs = gridspec.GridSpec(2, 1, height_ratios=[10, 1], hspace=0.5)
 
-    # Main heatmap axis
-    ax0 = fig2.add_subplot(gs[0])
-    divider0 = make_axes_locatable(ax0)
-    cax0 = divider0.append_axes("right", size="5%", pad=0.1)
-    im0 = ax0.imshow(cross_att, cmap='viridis', aspect='auto', origin='upper')
-    fig2.colorbar(im0, cax=cax0, label='Value')
-    ax0.set_xticks([])
-    ax0.set_ylabel("Rows")
-    ax0.set_title("Heatmap with Boolean Mask")
+        # Main heatmap axis
+        ax0 = fig2.add_subplot(gs[0])
+        divider0 = make_axes_locatable(ax0)
+        cax0 = divider0.append_axes("right", size="5%", pad=0.1)
+        im0 = ax0.imshow(cross_att, cmap='viridis', aspect='auto', origin='upper')
+        fig2.colorbar(im0, cax=cax0, label='Value')
+        ax0.set_xticks([])
+        ax0.set_ylabel("Rows")
+        ax0.set_title("Cross-Attention Heatmap with Input Mask")
 
-    # Boolean mask axis
-    ax1 = fig2.add_subplot(gs[1], sharex=ax0)
-    divider1 = make_axes_locatable(ax1)
-    cax1 = divider1.append_axes("right", size="5%", pad=0.1)
-    im1 = ax1.imshow(input_miss, cmap='Greys', aspect='auto', origin='upper', vmin=0, vmax=1)
-    fig2.colorbar(im1, cax=cax1, ticks=[0, 1], label='Missing')
-    cax1.set_yticklabels(['False', 'True'])
+        # Boolean mask axis
+        ax1 = fig2.add_subplot(gs[1], sharex=ax0)
+        divider1 = make_axes_locatable(ax1)
+        cax1 = divider1.append_axes("right", size="5%", pad=0.1)
+        im1 = ax1.imshow(input_miss, cmap='Greys', aspect='auto', origin='upper', vmin=0, vmax=1)
+        fig2.colorbar(im1, cax=cax1, ticks=[0, 1], label='Missing')
+        cax1.set_yticklabels(['False', 'True'])
 
-    ax1.set_yticks([])
-    ax1.set_xlabel("Columns")
-    num_labels = min(M, 10)
-    step = M // num_labels if M > 10 else 1
+        ax1.set_yticks([])
+        ax1.set_xlabel("Columns")
+        num_labels = min(M, 10)
+        step = M // num_labels if M > 10 else 1
 
-    ax1.set_xticks(np.arange(0, M, step))
-    ax1.set_xticklabels(np.arange(0, M, step))
-    
-    fig2.savefig(join(save_dir, "cross_att.png"), dpi=300, bbox_inches='tight')
+        ax1.set_xticks(np.arange(0, M, step))
+        ax1.set_xticklabels(np.arange(0, M, step))
+        
+        fig2.savefig(join(save_dir, "cross_att.png"), dpi=300, bbox_inches='tight')
+        plt.close(fig2)
+        print(f"Saved attention heatmap to {join(save_dir, 'cross_att.png')}")
+    else:
+        print(f"Baseline model ({model_type}): skipping attention heatmap (not applicable)")
 
 
 # Legacy function for backward compatibility
@@ -443,9 +519,14 @@ def predict(
 
 
 if __name__ == "__main__":
-    datadir_path = r"../data/input"
-    config_path = r"../experiments/training/proT/proT_cat_dyconex_optimized/config_proT_dyconex_v5_1.yaml"
-    checkpoint_path = r"../experiments/training/proT/proT_cat_dyconex_optimized/k_0/checkpoints/epoch0-initial.ckpt"
+    
+    from os.path import dirname, abspath, join
+    
+    ROOT_DIR = dirname(dirname(dirname(abspath(__file__))))
+    print(ROOT_DIR)
+    datadir_path = join(ROOT_DIR, r"data/input")
+    config_path = join(ROOT_DIR, r"experiments/baseline_optuna/euler/baseline_proT_ishigami_sum_49228236/config_proT_ishigami_v5_2.yaml")
+    checkpoint_path = join(ROOT_DIR, r"experiments/baseline_optuna/euler/baseline_proT_ishigami_sum_49228236/optuna/run_0/k_0/checkpoints/best_checkpoint.ckpt")
 
     external_dataset = {
         "dataset": "ds_dx_pred_panel_MSI_01_01_2022-07_07_2025",
@@ -460,7 +541,6 @@ if __name__ == "__main__":
         config, 
         datadir_path, 
         checkpoint_path, 
-        external_dataset,
         dataset_label="all",
         cluster=False
     )

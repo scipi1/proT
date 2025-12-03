@@ -215,6 +215,7 @@ class ProT(nn.Module):
         if dec_input_pos is None and self.dec_causal_mask == True:
             warnings.warn(f"decoder causal_mask required {self.dec_causal_mask} but encoder got null input positions, set to False.")
         
+        breakpoint()
         # pass embedded target and encoder output to decoder
         dec_out, dec_self_att, dec_cross_att, dec_self_ent, dec_cross_ent = self.decoder(
             X=dec_input,

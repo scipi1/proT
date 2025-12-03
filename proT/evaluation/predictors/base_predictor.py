@@ -129,7 +129,8 @@ class BasePredictor(ABC):
         seed = self.config["training"]["seed"]
         
         if external_dataset is not None:
-            # External dataset: use simple loading without pre-split mode
+            # External dataset: predict from fresh data
+            # Feature implemented for the industrial partner
             dm = ProcessDataModule(
                 data_dir=join(self.datadir_path, external_dataset["dataset"]),
                 input_file=external_dataset["filename_input"],

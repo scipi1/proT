@@ -28,6 +28,8 @@ class ProcessDataModule(pl.LightningDataModule):
         num_workers: int,
         data_format: str,
         max_data_size: int=None,
+        input_p_blank: float=None,
+        input_blanking_val_idx: int=0,
         seed:int=42,
         train_file: str=None,
         test_file: str=None,
@@ -43,6 +45,8 @@ class ProcessDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.data_format = data_format
         self.max_data_size = max_data_size
+        self.input_p_blank = input_p_blank
+        self.input_blanking_val_idx = input_blanking_val_idx
         self.seed = seed
         self.train_file = train_file
         self.test_file = test_file
@@ -97,6 +101,9 @@ class ProcessDataModule(pl.LightningDataModule):
                 self.X_train_tensor = torch.Tensor(X_train_np.astype(self.data_format))
                 self.Y_train_tensor = torch.Tensor(Y_train_np.astype(self.data_format))
                 
+                # Apply input blanking to training data only
+                self.X_train_tensor = self._apply_input_blanking(self.X_train_tensor)
+                
                 # Create datasets from pre-split tensors
                 self.train_ds = TensorDataset(self.X_train_tensor, self.Y_train_tensor)
                 self.val_ds = self.train_ds           
@@ -150,6 +157,9 @@ class ProcessDataModule(pl.LightningDataModule):
             # Convert to tensors immediately
             self.X_tensor = torch.Tensor(X_np.astype(self.data_format))
             self.Y_tensor = torch.Tensor(Y_np.astype(self.data_format))
+            
+            # Apply input blanking before splitting
+            self.X_tensor = self._apply_input_blanking(self.X_tensor)
 
             self.all_ds = TensorDataset(self.X_tensor, self.Y_tensor)
 
@@ -159,6 +169,41 @@ class ProcessDataModule(pl.LightningDataModule):
             return
     
     
+    def _apply_input_blanking(self, X_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Apply Bernoulli(beta) blanking to input tensor.
+        
+        Randomly blanks tokens in the input sequence using Bernoulli(beta) sampling.
+        Each token position is independently sampled, and if sampled as 1, the value 
+        feature at the specified index is set to NaN.
+        
+        Args:
+            X_tensor: Input tensor (B x L x D)
+            
+        Returns:
+            Blanked tensor with same shape as input
+        """
+        # Skip blanking if beta is None or <= 0
+        if self.input_p_blank is None or self.input_p_blank <= 0:
+            return X_tensor
+        
+        B, L, D = X_tensor.shape
+        X_blanked = X_tensor.clone()
+        
+        # Create generator with seed for reproducibility
+        generator = torch.Generator().manual_seed(self.seed)
+        
+        # Sample Bernoulli(beta) for each position in the batch
+        # Shape: B x L
+        blank_mask = torch.bernoulli(
+            torch.full((B, L), self.input_p_blank),
+            generator=generator
+        ).bool()
+        
+        # Blank the value feature where mask is True
+        X_blanked[blank_mask, self.input_blanking_val_idx] = float('nan')
+        
+        return X_blanked
     
     
     def get_ds_len(self)->int:
@@ -235,7 +280,7 @@ class ProcessDataModule(pl.LightningDataModule):
             raise ValueError("Tensors not loaded. Call setup() or prepare_data() first.")
         
         # If no indices provided, perform automatic splitting
-        if self.train_idx is None and self.val_idx:
+        if self.train_idx is None and self.val_idx is None and self.test_idx is None:
             self.auto_split_ds()
         
         # Create datasets from indices

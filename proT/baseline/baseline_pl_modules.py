@@ -59,9 +59,30 @@ class RNNForecaster(pl.LightningModule):
         masked_target[:,:,self.val_idx] = 0
         predict_out = self.forward(x=input_tensor, y=masked_target)
         
+        # Check for NaN in predictions
+        if torch.isnan(predict_out).any():
+            self.log(f"{stage}_nan_detected", 1.0, on_step=True, on_epoch=False)
+            # Replace NaN predictions with zeros to prevent loss explosion
+            predict_out = torch.nan_to_num(predict_out, nan=0.0)
+        
         trg = torch.nan_to_num(Y[:,:,self.val_idx])
+        
+        # Additional safety: clip extremely large values that might lead to NaN
+        predict_out = torch.clamp(predict_out, min=-1e6, max=1e6)
+        
         mse_per_elem = self.loss_fn(predict_out, trg)
+        
+        # Check for NaN in loss
+        if torch.isnan(mse_per_elem).any():
+            self.log(f"{stage}_loss_nan_detected", 1.0, on_step=True, on_epoch=False)
+            mse_per_elem = torch.nan_to_num(mse_per_elem, nan=1e6)  # Large penalty for NaN
+        
         loss = mse_per_elem.mean()
+        
+        # Final check: if loss itself is NaN, replace with large value
+        if torch.isnan(loss):
+            self.log(f"{stage}_final_loss_nan", 1.0, on_step=True, on_epoch=False)
+            loss = torch.tensor(1e6, device=loss.device, requires_grad=True)
         
         for name, metric in [("mae", self.mae), ("rmse", self.rmse), ("r2", self.r2)]:
             metric_eval = metric(predict_out.reshape(-1)  , trg.reshape(-1)  )                         
@@ -88,6 +109,25 @@ class RNNForecaster(pl.LightningModule):
         return loss
     
     
+    def on_before_optimizer_step(self, optimizer):
+        """
+        Optional: Monitor gradients for NaN/Inf values before optimizer step.
+        This helps identify which parameters are causing numerical issues.
+        """
+        # Check for NaN or Inf in gradients
+        valid_gradients = True
+        for name, param in self.named_parameters():
+            if param.grad is not None:
+                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                    valid_gradients = False
+                    # Log which parameter has invalid gradients (useful for debugging)
+                    grad_norm = param.grad.norm().item()
+                    self.log(f"grad_norm_{name.replace('.', '_')}", grad_norm, on_step=True, on_epoch=False)
+        
+        if not valid_gradients:
+            self.log("invalid_gradients_detected", 1.0, on_step=True, on_epoch=False)
+    
+    
     def configure_optimizers(self):
         optim_cfg = self.hparams.get("training", {})
         opt = torch.optim.AdamW(
@@ -97,6 +137,13 @@ class RNNForecaster(pl.LightningModule):
             betas        = optim_cfg.get("betas", (0.9, 0.999)),
         )
 
+        # Add gradient clipping configuration
+        optimizer_config = {
+            "optimizer": opt,
+            "gradient_clip_val": optim_cfg.get("gradient_clip_val", 1.0),  # default max_norm=1.0
+            "gradient_clip_algorithm": "norm"
+        }
+
         sched_cfg = optim_cfg.get("scheduler")
         if sched_cfg:
             sched = torch.optim.lr_scheduler.StepLR(
@@ -104,13 +151,10 @@ class RNNForecaster(pl.LightningModule):
                 step_size = sched_cfg.get("step_size", 10),
                 gamma     = sched_cfg.get("gamma", 0.1),
             )
-            return {
-                "optimizer":   opt,
-                "lr_scheduler": {
-                    "scheduler": sched,
-                    "interval":  "epoch",
-                    "monitor":   "val_loss",
-                },
+            optimizer_config["lr_scheduler"] = {
+                "scheduler": sched,
+                "interval":  "epoch",
+                "monitor":   "val_loss",
             }
 
-        return opt
+        return optimizer_config

@@ -74,24 +74,23 @@ def trainer(
     # get model object from configuration (version 4.6.0 or higher)
     model_object = get_model_object(config)
     
-    # check functions compatibility
-    if plot_pred_check:
-        if model_object not in ["proT"]:
-            raise NotImplementedError("Quick prediction plot not available for the current model, set plot_pred_check=False")
+    # Note: plot_pred_check now works with all model types (proT and baselines)
     
     
     dm = ProcessDataModule(
-        data_dir = join(data_dir,config["data"]["dataset"]),
-        input_file =  config["data"]["filename_input"],
-        target_file = config["data"]["filename_target"],
-        batch_size =  config["training"]["batch_size"],
-        num_workers = 1 if cluster else 20,
-        data_format = "float32",
-        max_data_size = config["data"]["max_data_size"],
-        seed = seed,
-        train_file = config["data"].get("train_file", None),
-        test_file = config["data"].get("test_file", None),
-        use_val_split=True
+        data_dir                = join(data_dir,config["data"]["dataset"]),
+        input_file              = config["data"]["filename_input"],
+        target_file             = config["data"]["filename_target"],
+        batch_size              =  config["training"]["batch_size"],
+        num_workers             = 1 if cluster else 20, # change it to your local number of workers
+        data_format             = "float32",
+        max_data_size           = config["data"]["max_data_size"],
+        input_p_blank           = config["data"].get("input_p_blank", None),
+        input_blanking_val_idx  = config["data"]["features"]["X"]["value"],
+        seed                    = seed,
+        train_file              = config["data"].get("train_file", None),
+        test_file               = config["data"].get("test_file", None),
+        use_val_split           = True
     )
     
     
@@ -137,6 +136,10 @@ def trainer(
     temp_model = model_object(config)
     trainable_params = sum(p.numel() for p in temp_model.parameters() if p.requires_grad)
     del temp_model  # Clean up temporary model
+    
+    # Initialize variables for tracking last fold's checkpoint
+    last_checkpoint_path = None
+    last_save_dir_k = None
     
     for fold, (train_local_idx, val_local_idx) in enumerate(kfold.split(train_val_idx)):
         
@@ -263,13 +266,31 @@ def trainer(
         
         # Add fold result to tracker
         kfold_tracker.add_fold_result(fold, fold_metrics, best_checkpoint_path)
+        
+        # Track checkpoint for plotting (from last fold)
+        last_save_dir_k = save_dir_k
+        if best and best_checkpoint_path is not None:
+            last_checkpoint_path = best_checkpoint_path
+        else:
+            # Use last checkpoint from this fold
+            last_checkpoint_path = join(save_dir_k, "checkpoints", "best_checkpoint.ckpt")
     
     # Convert the dictionary to a pandas DataFrame
     df_metric = pd.DataFrame.from_dict(metrics_dict, orient='index')
     df_metric = df_metric.map(lambda x: x.item() if isinstance(x, torch.Tensor) else x) # Convert tensor values to floats
     
     if plot_pred_check:
-        mk_quick_pred_plot(model=model, dm=dm, val_idx=config["data"]["val_idx"], save_dir=save_dir)
+        # Use tracked checkpoint from last fold
+        if last_checkpoint_path and os.path.exists(last_checkpoint_path):
+            mk_quick_pred_plot(
+                config=config,
+                checkpoint_path=last_checkpoint_path,
+                datadir_path=data_dir,
+                val_idx=config["data"]["val_idx"],
+                save_dir=save_dir
+            )
+        else:
+            print(f"Warning: Could not create prediction plot. Checkpoint not found at {last_checkpoint_path}")
 
     return df_metric
 
@@ -311,7 +332,7 @@ if __name__ == "__main__":
     import re
     
     ROOT_DIR = dirname(dirname(dirname(abspath(__file__))))
-    exp_dir = join(ROOT_DIR, "experiments/baseline_optuna/baseline_S6_ishigami_sum")
+    exp_dir = join(ROOT_DIR, "experiments/training/tests/protocol/test_baseline_proT_ishigami_sum")
     data_dir = join(ROOT_DIR, "data/input/")
     
     # look for config file
