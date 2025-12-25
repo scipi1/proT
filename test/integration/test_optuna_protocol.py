@@ -8,6 +8,14 @@ This ensures that:
 1. All model sampling functions work correctly
 2. The Optuna workflow (create/resume/summary) executes without errors
 3. Code changes don't break Optuna integration
+
+
+Examples
+
+One experiment, e.g. test_forecaster_proT_adaptive_random
+pytest test/integration/test_optuna_protocol.py::test_optuna_workflow_compatibility[test_forecaster_proT_adaptive_random] -v -s
+
+
 """
 
 import pytest
@@ -244,10 +252,6 @@ def test_optuna_workflow_compatibility(experiment_name, config_path, temp_output
         except:
             pass
         gc.collect()
-
-
-# Mark tests as slow for CI filtering
-pytestmark = pytest.mark.slow
 
 
 if __name__ == "__main__":

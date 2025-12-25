@@ -287,7 +287,11 @@ def compute_prediction_metrics(
                     val = fn(yp, yt)  # (D,)
                 else:
                     # Compute per feature
-                    val = torch.stack([fn(yp[:, d], yt[:, d]) for d in range(D)])
+                    feature_vals = []
+                    for d in range(D):
+                        fn.reset()  # Reset between features to avoid state accumulation
+                        feature_vals.append(fn(yp[:, d], yt[:, d]))
+                    val = torch.stack(feature_vals)
                 
                 metric_vals[name] = val.detach().cpu()
             
@@ -368,7 +372,11 @@ def _compute_global_metrics(
                 fn.multioutput = 'raw_values'
                 val = fn(y_pred_cat, y_true_cat)  # (D,)
             else:
-                val = torch.stack([fn(y_pred_cat[:, d], y_true_cat[:, d]) for d in range(D)])
+                feature_vals = []
+                for d in range(D):
+                    fn.reset()  # Reset between features to avoid state accumulation
+                    feature_vals.append(fn(y_pred_cat[:, d], y_true_cat[:, d]))
+                val = torch.stack(feature_vals)
             metric_vals[name] = val.detach().cpu()
         
         # Fill R2 with NaN if it was skipped

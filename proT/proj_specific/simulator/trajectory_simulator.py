@@ -10,10 +10,10 @@ import itertools
 
 
 class ISTSimulator(nn.Module):
-    def __init__(self, model, L=200, num_vars=2, *args, **kwargs):
+    def __init__(self, model, L=200, num_signals=2, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
-        self.num_vars = num_vars    # number of variables, generally 2 (SenseA, SenseB)
+        self.num_vars = num_signals    # number of signals, generally 2 (SenseA, SenseB)
         if model == "F":
             self.simulator_model = FractureIST(L)
         else:
@@ -21,10 +21,10 @@ class ISTSimulator(nn.Module):
         
         # they depend on the dataset, hard-coded for now, might read from config
         self.val_idx = 0
-        self.pos_idx = 1
+        self.sig_idx = 1
         self.var_idx = 2
         
-        self.vars = torch.tensor([1,2]) # senseA or senseB
+        self.signals = torch.tensor([1,2]) # senseA or senseB
         
     def forward(self, transformer_out: torch.Tensor):
         """_summary_
@@ -45,10 +45,10 @@ class ISTSimulator(nn.Module):
     
     def get_decoder_input(self,batch_size: int, device: str):
         
-        pos = self.simulator_model.get_pos()
+        pos = self.simulator_model.get_vars()
         
         # Generate all combinations of pos and vars
-        combinations = list(itertools.product(self.vars, pos))
+        combinations = list(itertools.product(self.signals, pos))
 
         # Create a tensor for the combinations
         comb_tensor = torch.tensor(combinations, dtype=torch.float32)
@@ -56,19 +56,19 @@ class ISTSimulator(nn.Module):
         # Create the tensor for a single batch element
         single_batch_tensor = torch.zeros((len(combinations), 3), device=device)
         single_batch_tensor[:, self.val_idx] = 0                   # value set 0
-        single_batch_tensor[:, self.pos_idx] = comb_tensor[:, 1]   # position
-        single_batch_tensor[:, self.var_idx] = comb_tensor[:, 0]   # variable
+        single_batch_tensor[:, self.sig_idx] = comb_tensor[:, 0]   # signals
+        single_batch_tensor[:, self.var_idx] = comb_tensor[:, 1]   # variables
 
         # Expand the tensor to the desired batch size B
         return single_batch_tensor.unsqueeze(0).expand(batch_size, -1, -1)
     
     def _prepare_transformer_out(self, transformer_out: torch.Tensor):
         
-        # Splits the output tensor in v tensors, where v is the number of variables
-        # usually v=2, (Sense A and Sense B)
+        # Splits the output tensor in s tensors, where s is the number of signals
+        # usually s=2, (Sense A and Sense B)
         # results is a list[tensors] to feed the forward method
-        # transformer_out is [bs x num_vars*num_pos x D] 
-        # (D=3: 0:group_id, 1: position, 2: value)
+        # transformer_out is [bs x num_signals x num_vars x D] 
+        
         return  list(transformer_out.chunk(self.num_vars,1)) # splits the positions having the same variable 
 
 
@@ -100,7 +100,7 @@ class DuctileIST(nn.Module):
             
         return torch.nan_to_num(torch.cat(out, dim=-1))             # shape [batch, L]
     
-    def get_pos(self):
+    def get_vars(self):
         return torch.tensor([1,2])
     
     
@@ -148,7 +148,7 @@ class FractureIST(nn.Module):
 
         return torch.stack(out, dim=-1)
     
-    def get_pos(self):
+    def get_vars(self):
         num_params = 7
         return torch.arange(1,num_params+1)
         
@@ -168,5 +168,3 @@ if __name__ == "__main__":
     
     simulator_out = simulator(decoder_input)
     print(f"forecast output shape: {simulator_out.shape}")
-    
-    

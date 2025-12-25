@@ -227,6 +227,8 @@ def TCN_sample_params(trial):
 
 def proT_sample_params(trial, config):
     """
+    Unified sampling function for proT, proT_sim, and proT_adaptive variants.
+    
     Return a flat dict param_name -> sampled value.
     
     Supports embedding dimension optimization based on config flag:
@@ -248,37 +250,31 @@ def proT_sample_params(trial, config):
         comps_embed_enc = config.get("model", {}).get("kwargs", {}).get("comps_embed_enc", "concat")
         comps_embed_dec = config.get("model", {}).get("kwargs", {}).get("comps_embed_dec", "concat")
         
-        # Force uniform dimensions if summation is used (architectural requirement)
         if comps_embed_enc == "summation" or comps_embed_dec == "summation":
-            use_uniform = True
+            params.update({"experiment.d_model_set": trial.suggest_int("d_model_set", **SAMPLING_BOUNDS["embedding_dim_standard"]) })
         
-        if use_uniform:
-            # Single dimension for all embeddings
-            d_model = trial.suggest_int("d_model_set", **SAMPLING_BOUNDS["embedding_dim_standard"])
-            params.update({
-                "model.embed_dim.enc_val_emb_hidden": d_model,
-                "model.embed_dim.enc_var_emb_hidden": d_model,
-                "model.embed_dim.enc_pos_emb_hidden": d_model,
-                "model.embed_dim.enc_time_emb_hidden": d_model,
-                "model.embed_dim.dec_val_emb_hidden": d_model,
-                "model.embed_dim.dec_var_emb_hidden": d_model,
-                "model.embed_dim.dec_pos_emb_hidden": d_model,
-                "model.embed_dim.dec_time_emb_hidden": d_model,
-            })
-        else:
+        if comps_embed_enc == "concat":
             # Independent dimensions per embedding
             params.update({
-                "model.embed_dim.enc_val_emb_hidden": trial.suggest_int("enc_val_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
-                "model.embed_dim.enc_var_emb_hidden": trial.suggest_int("enc_var_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
-                "model.embed_dim.enc_pos_emb_hidden": trial.suggest_int("enc_pos_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
-                "model.embed_dim.enc_time_emb_hidden": trial.suggest_int("enc_time_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_time"]),
-                "model.embed_dim.dec_val_emb_hidden": trial.suggest_int("dec_val_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
-                "model.embed_dim.dec_var_emb_hidden": trial.suggest_int("dec_var_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
-                "model.embed_dim.dec_pos_emb_hidden": trial.suggest_int("dec_pos_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
-                "model.embed_dim.dec_time_emb_hidden": trial.suggest_int("dec_time_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_time"]),
+                "model.embed_dim.enc_val_emb_hidden"    : trial.suggest_int("enc_val_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
+                "model.embed_dim.enc_var_emb_hidden"    : trial.suggest_int("enc_var_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
+                "model.embed_dim.enc_pos_emb_hidden"    : trial.suggest_int("enc_pos_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
+                "model.embed_dim.enc_pro_emb_hidden"    : trial.suggest_int("enc_pro_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
+                "model.embed_dim.enc_occ_emb_hidden"    : trial.suggest_int("enc_occ_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
+                "model.embed_dim.enc_step_emb_hidden"   : trial.suggest_int("enc_step_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
+                "model.embed_dim.enc_time_emb_hidden"   : trial.suggest_int("enc_time_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_time"]),
+                "model.embed_dim.dec_val_given_emb_hidden": trial.suggest_int("dec_val_given_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_adaptive"])
+                })
+        
+        if comps_embed_dec == "concat":
+            params.update({
+                "model.embed_dim.dec_val_emb_hidden"    : trial.suggest_int("dec_val_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
+                "model.embed_dim.dec_var_emb_hidden"    : trial.suggest_int("dec_var_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
+                "model.embed_dim.dec_pos_emb_hidden"    : trial.suggest_int("dec_pos_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
+                "model.embed_dim.dec_time_emb_hidden"   : trial.suggest_int("dec_time_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_time"]),
             })
-    
-    # Architecture hyperparameters (always optimized)
+            
+        
     params.update({
         "experiment.e_layers": trial.suggest_int("e_layers", **SAMPLING_BOUNDS["e_layers"]),
         "experiment.d_layers": trial.suggest_int("d_layers", **SAMPLING_BOUNDS["d_layers"]),
@@ -288,59 +284,6 @@ def proT_sample_params(trial, config):
         "experiment.dropout": trial.suggest_float("dropout", **SAMPLING_BOUNDS["dropout_fine"]),
         "training.lr": trial.suggest_float("lr", **SAMPLING_BOUNDS["lr_stepped"]),
         "training.gamma": trial.suggest_float("gamma", **SAMPLING_BOUNDS["gamma"]),
-    })
-    
-    return params
-
-
-def proT_adaptive_sample_params(trial, config):
-    """
-    Return a flat dict param_name -> sampled value for proT_adaptive variant.
-    
-    Key difference from standard proT:
-    - Has additional dec_val_given_emb_hidden for adaptive target embedding
-    
-    Supports optimize_embeddings flag like standard proT:
-    - optimize_embeddings=False: Embedding dimensions set in config (fair baseline mode)
-    - optimize_embeddings=True: Sample embedding dimensions with Optuna
-    
-    Note: For fair baseline comparisons, set optimize_embeddings=False in config.
-    """
-    optimize_embeddings = config.get("experiment", {}).get("optimize_embeddings", True)
-    
-    params = {}
-    
-    if optimize_embeddings:
-        # OPTIMIZATION MODE: Sample embedding dimensions
-        params.update({
-            "model.embed_dim.enc_val_emb_hidden"        : trial.suggest_int("enc_val_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
-            "model.embed_dim.enc_var_emb_hidden"        : trial.suggest_int("enc_var_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
-            "model.embed_dim.enc_pos_emb_hidden"        : trial.suggest_int("enc_pos_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
-            "model.embed_dim.enc_time_emb_hidden"       : trial.suggest_int("enc_time_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_time"]),
-            "model.embed_dim.dec_val_emb_hidden"        : trial.suggest_int("dec_val_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
-            "model.embed_dim.dec_var_emb_hidden"        : trial.suggest_int("dec_var_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
-            "model.embed_dim.dec_pos_emb_hidden"        : trial.suggest_int("dec_pos_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_standard"]),
-            "model.embed_dim.dec_time_emb_hidden"       : trial.suggest_int("dec_time_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_time"]),
-            "model.embed_dim.dec_val_given_emb_hidden"  : trial.suggest_int("dec_val_given_emb_hidden", **SAMPLING_BOUNDS["embedding_dim_adaptive"]),
-        })
-    
-    # Architecture hyperparameters (always optimized)
-    params.update({
-        "model.kwargs.n_heads"                      : trial.suggest_int("n_heads", **SAMPLING_BOUNDS["n_heads"]),
-        "model.kwargs.d_ff"                         : trial.suggest_int("d_ff", **SAMPLING_BOUNDS["d_ff"]),
-        "model.kwargs.d_qk"                         : trial.suggest_int("d_qk", **SAMPLING_BOUNDS["d_qk"]),
-        "model.kwargs.dropout_emb"                  : trial.suggest_float("dropout_emb", **SAMPLING_BOUNDS["dropout_fine"]),
-        "model.kwargs.dropout_data"                 : trial.suggest_float("dropout_data", **SAMPLING_BOUNDS["dropout_fine"]),
-        "model.kwargs.dropout_attn_out"             : trial.suggest_float("dropout_attn_out", **SAMPLING_BOUNDS["dropout_fine"]),
-        "model.kwargs.dropout_ff"                   : trial.suggest_float("dropout_ff", **SAMPLING_BOUNDS["dropout_fine"]),
-        "model.kwargs.enc_dropout_qkv"              : trial.suggest_float("enc_dropout_qkv", **SAMPLING_BOUNDS["dropout_fine"]),
-        "model.kwargs.enc_attention_dropout"        : trial.suggest_float("enc_attention_dropout", **SAMPLING_BOUNDS["dropout_fine"]),
-        "model.kwargs.dec_self_dropout_qkv"         : trial.suggest_float("dec_self_dropout_qkv", **SAMPLING_BOUNDS["dropout_fine"]),
-        "model.kwargs.dec_self_attention_dropout"   : trial.suggest_float("dec_self_attention_dropout", **SAMPLING_BOUNDS["dropout_fine"]),
-        "model.kwargs.dec_cross_dropout_qkv"        : trial.suggest_float("dec_cross_dropout_qkv", **SAMPLING_BOUNDS["dropout_fine"]),
-        "model.kwargs.dec_cross_attention_dropout"  : trial.suggest_float("dec_cross_attention_dropout", **SAMPLING_BOUNDS["dropout_fine"]),
-        "training.lr"                               : trial.suggest_float("lr", **SAMPLING_BOUNDS["lr_stepped"]),
-        "training.gamma"                            : trial.suggest_float("gamma", **SAMPLING_BOUNDS["gamma"]),
     })
     
     return params
@@ -363,11 +306,9 @@ def sample_params_for_optuna(trial, config):
     """
     model_obj = config["model"]["model_object"]
     
-    # proT models need config passed for uniform embedding dimension support
-    if model_obj in ["proT", "proT_sim"]:
+    # All proT variants use the unified proT_sample_params function
+    if model_obj in ["proT", "proT_sim", "proT_adaptive"]:
         return proT_sample_params(trial, config)
-    elif model_obj == "proT_adaptive":
-        return proT_adaptive_sample_params(trial, config)
     
     # Other models use simple trial-only sampling
     params_select = {

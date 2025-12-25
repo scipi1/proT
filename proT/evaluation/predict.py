@@ -69,7 +69,6 @@ def create_predictor(
         available = list(PREDICTOR_REGISTRY.keys())
         raise ValueError(f"Unknown model type: {model_obj}. Available: {available}")
     
-    print(config["model"]["kwargs"].get("causal_mask", "No Causal mask found!"))
     # Initialize predictor - it handles everything internally
     return predictor_class(config, checkpoint_path, datadir_path)
 
@@ -261,6 +260,58 @@ def predict_test_from_ckpt_adaptive(
     return results
 
 
+def _plot_attention_heatmap(
+    cross_att: np.ndarray,
+    input_miss: np.ndarray,
+    save_path: str,
+    title: str
+):
+    """
+    Helper function to create a single attention heatmap plot with input mask.
+    
+    Args:
+        cross_att: Cross-attention matrix (N x M) where N=target length, M=source length
+        input_miss: Boolean mask for missing inputs (1 x M)
+        save_path: Path to save the figure
+        title: Title for the plot
+    """
+    N, M = cross_att.shape
+    
+    # Create figure and grid
+    fig = plt.figure(figsize=(6, 5))
+    gs = gridspec.GridSpec(2, 1, height_ratios=[10, 1], hspace=0.5)
+
+    # Main heatmap axis
+    ax0 = fig.add_subplot(gs[0])
+    divider0 = make_axes_locatable(ax0)
+    cax0 = divider0.append_axes("right", size="5%", pad=0.1)
+    im0 = ax0.imshow(cross_att, cmap='viridis', aspect='auto', origin='upper')
+    fig.colorbar(im0, cax=cax0, label='Value')
+    ax0.set_xticks([])
+    ax0.set_ylabel("Rows")
+    ax0.set_title(title)
+
+    # Boolean mask axis
+    ax1 = fig.add_subplot(gs[1], sharex=ax0)
+    divider1 = make_axes_locatable(ax1)
+    cax1 = divider1.append_axes("right", size="5%", pad=0.1)
+    im1 = ax1.imshow(input_miss, cmap='Greys', aspect='auto', origin='upper', vmin=0, vmax=1)
+    fig.colorbar(im1, cax=cax1, ticks=[0, 1], label='Missing')
+    cax1.set_yticklabels(['False', 'True'])
+
+    ax1.set_yticks([])
+    ax1.set_xlabel("Columns")
+    num_labels = min(M, 10)
+    step = M // num_labels if M > 10 else 1
+
+    ax1.set_xticks(np.arange(0, M, step))
+    ax1.set_xticklabels(np.arange(0, M, step))
+    
+    fig.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved attention heatmap to {save_path}")
+
+
 def mk_quick_pred_plot(
     config: dict,
     checkpoint_path: Path,
@@ -273,6 +324,7 @@ def mk_quick_pred_plot(
     
     Works with both transformer models (proT) and baseline models (LSTM, GRU, TCN, MLP, S6).
     Uses the predictor infrastructure to automatically handle different model types.
+    Supports multi-head attention by creating separate plots for each head plus a summed plot.
     
     Args:
         config: Configuration dictionary
@@ -370,49 +422,55 @@ def mk_quick_pred_plot(
     if attention_weights is not None and 'cross' in attention_weights:
         cross_att_array = attention_weights['cross']
         
-        # Handle dimensions
-        if len(cross_att_array.shape) == 2:
-            cross_att_array = np.expand_dims(cross_att_array, axis=0)
+        # Debug: Print original attention shape
+        print(f"[DEBUG] Original cross-attention shape: {cross_att_array.shape}")
         
-        cross_att = cross_att_array[0]
+        # Handle dimensions - ensure we have at least 3D (B x N x M)
+        if len(cross_att_array.shape) == 2:
+            # (N, M) -> (1, N, M)
+            cross_att_array = np.expand_dims(cross_att_array, axis=0)
+            print(f"[DEBUG] Expanded to shape: {cross_att_array.shape}")
+        
+        # Prepare input mask (same for all attention plots)
         input_miss_bool = np.isnan(input_array[0, :, val_idx].squeeze())
         input_miss = input_miss_bool[np.newaxis, :].astype(int)
         
-        N, M = cross_att.shape
-        
-        # Create figure and grid
-        fig2 = plt.figure(figsize=(6, 5))
-        gs = gridspec.GridSpec(2, 1, height_ratios=[10, 1], hspace=0.5)
-
-        # Main heatmap axis
-        ax0 = fig2.add_subplot(gs[0])
-        divider0 = make_axes_locatable(ax0)
-        cax0 = divider0.append_axes("right", size="5%", pad=0.1)
-        im0 = ax0.imshow(cross_att, cmap='viridis', aspect='auto', origin='upper')
-        fig2.colorbar(im0, cax=cax0, label='Value')
-        ax0.set_xticks([])
-        ax0.set_ylabel("Rows")
-        ax0.set_title("Cross-Attention Heatmap with Input Mask")
-
-        # Boolean mask axis
-        ax1 = fig2.add_subplot(gs[1], sharex=ax0)
-        divider1 = make_axes_locatable(ax1)
-        cax1 = divider1.append_axes("right", size="5%", pad=0.1)
-        im1 = ax1.imshow(input_miss, cmap='Greys', aspect='auto', origin='upper', vmin=0, vmax=1)
-        fig2.colorbar(im1, cax=cax1, ticks=[0, 1], label='Missing')
-        cax1.set_yticklabels(['False', 'True'])
-
-        ax1.set_yticks([])
-        ax1.set_xlabel("Columns")
-        num_labels = min(M, 10)
-        step = M // num_labels if M > 10 else 1
-
-        ax1.set_xticks(np.arange(0, M, step))
-        ax1.set_xticklabels(np.arange(0, M, step))
-        
-        fig2.savefig(join(save_dir, "cross_att.png"), dpi=300, bbox_inches='tight')
-        plt.close(fig2)
-        print(f"Saved attention heatmap to {join(save_dir, 'cross_att.png')}")
+        # Check for multi-head attention (4D: B x H x N x M)
+        if len(cross_att_array.shape) == 4:
+            num_heads = cross_att_array.shape[1]
+            print(f"[DEBUG] Multi-head attention detected: {num_heads} heads")
+            
+            # Plot 1: Summed attention across all heads
+            cross_att_sum = cross_att_array[0].sum(axis=0)  # Sum over head dimension
+            print(f"[DEBUG] Summed attention shape: {cross_att_sum.shape}")
+            _plot_attention_heatmap(
+                cross_att_sum,
+                input_miss,
+                join(save_dir, "cross_att_sum.png"),
+                "Cross-Attention (Summed Across Heads)"
+            )
+            
+            # Plot 2-N: Individual head plots
+            for head_idx in range(num_heads):
+                cross_att_head = cross_att_array[0, head_idx, :, :]
+                print(f"[DEBUG] Head {head_idx} attention shape: {cross_att_head.shape}")
+                _plot_attention_heatmap(
+                    cross_att_head,
+                    input_miss,
+                    join(save_dir, f"cross_att_head_{head_idx}.png"),
+                    f"Cross-Attention Head {head_idx}"
+                )
+        else:
+            # Single head or pre-aggregated (3D: B x N x M)
+            print("[DEBUG] Single-head attention detected (or pre-aggregated)")
+            cross_att = cross_att_array[0]
+            print(f"[DEBUG] Attention shape for plotting: {cross_att.shape}")
+            _plot_attention_heatmap(
+                cross_att,
+                input_miss,
+                join(save_dir, "cross_att.png"),
+                "Cross-Attention Heatmap"
+            )
     else:
         print(f"Baseline model ({model_type}): skipping attention heatmap (not applicable)")
 

@@ -22,6 +22,12 @@ class ProT(nn.Module):
     """
     ProT based on Spacetimeformer (https://github.com/QData/spacetimeformer)
     Required data shapes: (BATCH_SIZE, sequence_length, variables)
+    
+    Causal Masking:
+        To enable causal masking (enc_causal_mask or dec_causal_mask), you must 
+        configure a position variable in your embedding configuration. The position
+        variable should use "embed": "pass" to pass through to the attention layers
+        where it will be used to construct a lower triangular causal mask.
     """
     def __init__(
         self,
@@ -190,7 +196,11 @@ class ProT(nn.Module):
         
         if enc_input_pos is None and self.enc_causal_mask == True:
             self.enc_causal_mask = False
-            warnings.warn(f"encoder causal_mask required {self.enc_causal_mask} but encoder got null input positions, set to False.")
+            warnings.warn(
+                f"Encoder causal_mask is set to True but encoder received null input positions. "
+                f"To use causal masking, you must configure a position variable with 'embed': 'pass' in the "
+                f"encoder embedding configuration (ds_embed_enc). Causal mask has been disabled."
+            )
         
         # pass embedded input to encoder
         enc_out, enc_self_att, enc_self_ent = self.encoder(
@@ -213,9 +223,13 @@ class ProT(nn.Module):
             dec_cross_mask = None
         
         if dec_input_pos is None and self.dec_causal_mask == True:
-            warnings.warn(f"decoder causal_mask required {self.dec_causal_mask} but encoder got null input positions, set to False.")
+            self.dec_causal_mask = False
+            warnings.warn(
+                f"Decoder causal_mask is set to True but decoder received null input positions. "
+                f"To use causal masking, you must configure a position variable with 'embed': 'pass' in the "
+                f"decoder embedding configuration (ds_embed_dec). Causal mask has been disabled."
+            )
         
-        breakpoint()
         # pass embedded target and encoder output to decoder
         dec_out, dec_self_att, dec_cross_att, dec_self_ent, dec_cross_ent = self.decoder(
             X=dec_input,

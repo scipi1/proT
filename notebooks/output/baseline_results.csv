@@ -1,12 +1,16 @@
-,model,dataset,test MAE,test R2,best fold test MAE,best fold test R2,average_epoch_training_time,number_trainable_params,best_trial
-0,GRU,dyconex,0.081+/-0.004,0.505+/-0.044,0.0758,0.5596,4.528630561496488,654793,../experiments/baseline_optuna/euler/baseline_GRU_dyconex_sum_50590459\optuna\run_23\kfold_summary.json
-1,GRU,ishigami,0.037+/-0.002,0.426+/-0.006,0.0348,0.4280,2.6282960787341367,35137,../experiments/baseline_optuna/euler/baseline_GRU_ishigami_sum_49813798\optuna\run_24\kfold_summary.json
-2,LSTM,dyconex,0.651+/-0.631,-36.17+/-50.446,0.0819,0.5084,5.151878642798656,340105,../experiments/baseline_optuna/euler/baseline_LSTM_dyconex_sum_50102170\optuna\run_14\kfold_summary.json
-3,LSTM,ishigami,0.037+/-0.001,0.426+/-0.003,0.0360,0.4216,2.97757419662096,370049,../experiments/baseline_optuna/euler/baseline_LSTM_ishigami_sum_49813765\optuna\run_8\kfold_summary.json
-4,MLP,dyconex,0.085+/-0.015,0.484+/-0.14,0.0727,0.5823,0.827372642298836,617737,../experiments/baseline_optuna/euler/baseline_MLP_dyconex_sum_49739127\optuna\run_4\kfold_summary.json
-5,MLP,ishigami,0.041+/-0.001,0.252+/-0.008,0.0396,0.2478,2.89811419966209,580737,../experiments/baseline_optuna/euler/baseline_MLP_ishigami_sum_49715174\optuna\run_2\kfold_summary.json
-6,proTNoNAIM,dyconex,0.065+/-0.002,0.642+/-0.016,0.0648,0.6589,2.937452330518125,1050301,../experiments/baseline_optuna/euler/baseline_proTNoNAIM_dyconex_sum_49859090\optuna\run_38\kfold_summary.json
-7,proTNoNAIM,ishigami,0.003+/-0.0,0.998+/-0.0,0.0024,0.9987,7.474363616449916,1164401,../experiments/baseline_optuna/euler/baseline_proTNoNAIM_ishigami_sum_49859067\optuna\run_43\kfold_summary.json
-8,proT,dyconex,0.067+/-0.003,0.631+/-0.018,0.0664,0.6405,2.2989160445199084,968501,../experiments/baseline_optuna/euler/baseline_proT_dyconex_sum_50191158\optuna\run_21\kfold_summary.json
-9,proT,ishigami,0.003+/-0.0,0.998+/-0.001,0.0024,0.9987,6.815513812487398,1334701,../experiments/baseline_optuna/euler/baseline_proT_ishigami_sum_50191137\optuna\run_29\kfold_summary.json
-10,TCN,dyconex,0.08+/-0.001,0.497+/-0.019,0.0794,0.4945,14.55348782278412,374409,../experiments/baseline_optuna/euler/baseline_TCN_dyconex_sum_49291666\optuna\run_3\kfold_summary.json
+,model,dataset,fusion,test MAE,test R2,best fold test MAE,best fold test R2,average_epoch_training_time,number_trainable_params,best_trial
+0,GRU,dyconex,sum,0.081+/-0.004,0.505+/-0.044,0.0758,0.5596,4.528630561496488,654793,../experiments/baseline_optuna/euler/baseline_GRU_dyconex_sum_50590459\optuna\run_23\kfold_summary.json
+1,GRU,ishigami,sum,0.037+/-0.002,0.426+/-0.006,0.0348,0.4280,2.6282960787341367,35137,../experiments/baseline_optuna/euler/baseline_GRU_ishigami_sum_49813798\optuna\run_24\kfold_summary.json
+2,LSTM,dyconex,sum,0.084+/-0.005,0.4+/-0.234,0.0770,0.5436,6.145012149763344,1542793,../experiments/baseline_optuna/euler/baseline_LSTM_dyconex_sum_50665586\optuna\run_25\kfold_summary.json
+3,LSTM,ishigami,sum,0.037+/-0.001,0.426+/-0.003,0.0360,0.4216,2.97757419662096,370049,../experiments/baseline_optuna/euler/baseline_LSTM_ishigami_sum_49813765\optuna\run_8\kfold_summary.json
+4,MLP,dyconex,sum,0.085+/-0.015,0.484+/-0.14,0.0727,0.5823,0.827372642298836,617737,../experiments/baseline_optuna/euler/baseline_MLP_dyconex_sum_49739127\optuna\run_4\kfold_summary.json
+5,MLP,ishigami,sum,0.041+/-0.001,0.252+/-0.008,0.0396,0.2478,2.89811419966209,580737,../experiments/baseline_optuna/euler/baseline_MLP_ishigami_sum_49715174\optuna\run_2\kfold_summary.json
+6,proTCVRand,dyconex,sum,0.061+/-0.006,0.719+/-0.047,0.0548,0.7802,10.214549419298693,6391621,../experiments/baseline_optuna/euler/baseline_proTCVRand_dyconex_sum_51972551\optuna\run_49\kfold_summary.json
+7,proTNoNAIM,dyconex,sum,0.068+/-0.003,0.62+/-0.021,0.0634,0.6455,5.466463886090179,1856501,../experiments/baseline_optuna/euler/baseline_proTNoNAIM_dyconex_sum_51289099\optuna\run_22\kfold_summary.json
+8,proTNoNAIM,ishigami,sum,0.003+/-0.0,0.998+/-0.0,0.0027,0.9983,8.617723685591969,1516801,../experiments/baseline_optuna/euler/baseline_proTNoNAIM_ishigami_sum_51289059\optuna\run_38\kfold_summary.json
+9,proTPhySim,dyconex,sum,0.076+/-0.002,0.531+/-0.018,0.0749,0.5413,6.485203009932788,1373401,../experiments/baseline_optuna/euler/baseline_proTPhySim_dyconex_sum_51773931\optuna\run_37\kfold_summary.json
+10,proT,dyconex,sum,0.066+/-0.003,0.636+/-0.019,0.0626,0.6638,1.876457901143316,384701,../experiments/baseline_optuna/euler/baseline_proT_dyconex_sum_50908169\optuna\run_33\kfold_summary.json
+11,proT,ishigami,cat,0.003+/-0.0,0.998+/-0.001,0.0026,0.9984,9.235009400998775,6517871,../experiments/baseline_optuna/euler/baseline_proT_ishigami_cat_51045226\optuna\run_46\kfold_summary.json
+12,proT,ishigami,sum,0.003+/-0.0,0.998+/-0.001,0.0022,0.9989,9.10586073742577,1054701,../experiments/baseline_optuna/euler/baseline_proT_ishigami_sum_51045209\optuna\run_45\kfold_summary.json
+13,TCN,dyconex,sum,0.08+/-0.001,0.497+/-0.019,0.0794,0.4945,14.55348782278412,374409,../experiments/baseline_optuna/euler/baseline_TCN_dyconex_sum_49291666\optuna\run_3\kfold_summary.json
+14,TCN,ishigami,sum,0.037+/-0.001,0.416+/-0.004,0.0358,0.4182,47.268611499919224,145985,../experiments/baseline_optuna/euler/baseline_TCN_ishigami_sum_51486519\optuna\run_7\kfold_summary.json

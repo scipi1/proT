@@ -32,8 +32,8 @@ class SimulatorForecaster(SimpleForecaster):
         super().__init__(config)
         
         # Initialize simulator components
-        simulator_model = config["training"].get("simulator_model", "F")
-        simulator = ISTSimulator(model="simulator_model")
+        simulator_model = config["training"].get("simulator_model", "D")
+        simulator = ISTSimulator(model=simulator_model)
         
         self.decoder_input_module = simulator.get_decoder_input
         self.trajectory_simulator = simulator.forward

@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 import time
+import traceback
 from os.path import dirname, abspath, join
 
 # Third-party imports
@@ -282,13 +283,24 @@ def trainer(
     if plot_pred_check:
         # Use tracked checkpoint from last fold
         if last_checkpoint_path and os.path.exists(last_checkpoint_path):
-            mk_quick_pred_plot(
-                config=config,
-                checkpoint_path=last_checkpoint_path,
-                datadir_path=data_dir,
-                val_idx=config["data"]["val_idx"],
-                save_dir=save_dir
-            )
+            try:
+                mk_quick_pred_plot(
+                    config=config,
+                    checkpoint_path=last_checkpoint_path,
+                    datadir_path=data_dir,
+                    val_idx=config["data"]["val_idx"],
+                    save_dir=save_dir
+                )
+            except Exception as e:
+                # Log error to file
+                error_log_path = join(save_dir, "plot_error.log")
+                with open(error_log_path, 'w') as f:
+                    f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"Error: {type(e).__name__}: {str(e)}\n\n")
+                    f.write(traceback.format_exc())
+                
+                # Print warning to console
+                print(f"Warning: Failed to create prediction plot. Error logged to {error_log_path}")
         else:
             print(f"Warning: Could not create prediction plot. Checkpoint not found at {last_checkpoint_path}")
 
@@ -332,7 +344,7 @@ if __name__ == "__main__":
     import re
     
     ROOT_DIR = dirname(dirname(dirname(abspath(__file__))))
-    exp_dir = join(ROOT_DIR, "experiments/training/tests/protocol/test_baseline_proT_ishigami_sum")
+    exp_dir = join(ROOT_DIR, "experiments/miss_vals/miss_vals_proT_ishigami_sum")
     data_dir = join(ROOT_DIR, "data/input/")
     
     # look for config file
@@ -355,5 +367,5 @@ if __name__ == "__main__":
         experiment_tag = "test", 
         cluster = False, 
         resume_ckpt = None,
-        plot_pred_check = False,
+        plot_pred_check = True,
         debug = True)

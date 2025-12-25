@@ -95,11 +95,36 @@ class ScaledDotAttention(nn.Module):
         else:
             M_q = torch.zeros_like(scores)
         
-        att = torch.relu(torch.softmax(scale * (scores + M_k), dim=-1) + M_q)
+        # Scale the attention scores
+        scaled_scores = scale * (scores + M_k)
         
-        # Attention entropy hook - register entropy before dropout
-        # if self.register_entropy:
-        #     register_attention_entropy(self.layer_name, att)
+        # Detect rows where ALL values are -inf (no valid attention targets)
+        # This happens when causal mask + missing data masks block all positions
+        all_neginf = torch.isinf(scaled_scores) & (scaled_scores < 0)
+        all_neginf_rows = all_neginf.all(dim=-1, keepdim=True)
+        
+        # Replace all-inf rows with zeros to prevent NaN in softmax
+        # This is mathematically correct: no valid keys = uniform zero attention
+        scaled_scores = torch.where(
+            all_neginf_rows.expand_as(scaled_scores), 
+            torch.zeros_like(scaled_scores), 
+            scaled_scores
+        )
+        
+        # Compute softmax (now safe from NaN)
+        att = torch.softmax(scaled_scores, dim=-1)
+        
+        # Zero out the attention for rows that were all -inf
+        att = torch.where(
+            all_neginf_rows.expand_as(att), 
+            torch.zeros_like(att), 
+            att
+        )
+        
+        check_nan(att, "att_after_softmax")
+        
+        # Apply query mask and relu
+        att = torch.relu(att + M_q)
         
         if self.entropy_enabled:
             entropy = calculate_attention_entropy(att)
@@ -165,7 +190,7 @@ def calculate_attention_entropy(att_weights: torch.Tensor, eps: float = 1e-8) ->
     
     # Calculate entropy: -sum(p * log(p)) along the key dimension (last dimension)
     log_att = torch.log(att_clamped)
-    entropy = -torch.sum(att_weights * log_att, dim=-1)
+    entropy = -torch.sum(att_clamped * log_att, dim=-1)
     
     # Handle NaN values that might arise from 0 * log(0)
     entropy = torch.nan_to_num(entropy, nan=0.0)
@@ -334,6 +359,12 @@ def main():
     print(f"Causal multi-head - Output shape: {out_causal.shape}, Score shape: {score_causal.shape}, Entropy shape: {ent.shape if ent is not None else 'None'}")
     print("All tests completed successfully!")
     
+    
+    
+def check_nan(tensor, name):
+    if torch.isnan(tensor).any():
+        print(f"NaN detected in {name}")
+        breakpoint()
     
 if __name__ == "__main__":
     main()

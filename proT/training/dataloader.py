@@ -187,23 +187,25 @@ class ProcessDataModule(pl.LightningDataModule):
         if self.input_p_blank is None or self.input_p_blank <= 0:
             return X_tensor
         
-        B, L, D = X_tensor.shape
-        X_blanked = X_tensor.clone()
-        
-        # Create generator with seed for reproducibility
-        generator = torch.Generator().manual_seed(self.seed)
-        
-        # Sample Bernoulli(beta) for each position in the batch
-        # Shape: B x L
-        blank_mask = torch.bernoulli(
-            torch.full((B, L), self.input_p_blank),
-            generator=generator
-        ).bool()
-        
-        # Blank the value feature where mask is True
-        X_blanked[blank_mask, self.input_blanking_val_idx] = float('nan')
-        
-        return X_blanked
+        else:
+            B, L, D = X_tensor.shape
+            X_blanked = X_tensor.clone()
+
+            # Create generator with seed for reproducibility
+            generator = torch.Generator().manual_seed(self.seed)
+
+            # Sample Bernoulli(beta) for each position in the batch
+            # Shape: B x L
+            blank_mask = torch.bernoulli(
+                torch.full((B, L), self.input_p_blank),
+                generator=generator
+            ).bool()
+
+            # Blank the value feature where mask is True
+            # Index the feature dimension first to avoid shape mismatch with 2D mask
+            X_blanked[:, :, self.input_blanking_val_idx][blank_mask] = float('nan')
+
+            return X_blanked
     
     
     def get_ds_len(self)->int:

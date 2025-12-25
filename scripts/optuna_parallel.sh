@@ -14,7 +14,7 @@ echo "Job ID: $SLURM_JOB_ID"
 # ───────────────────────────────────────────────────────────────────────
 # EXPERIMENT CONFIGURATION
 # ───────────────────────────────────────────────────────────────────────
-EXPERIMENT_ID="baseline_LSTM_ishigami_cat"
+EXPERIMENT_ID="baseline_proTCVRand_dyconex_sum"
 STUDY_NAME="optimization_study"
 N_TRIALS=20
 MAX_CONCURRENT_JOBS=6

@@ -95,6 +95,7 @@ class DecoderLayer(nn.Module):
         
         X3 = self.norm2(X2, not_self_mask_miss_q)
         
+        # Cross-attention is never causal - decoder queries attend to all encoder outputs
         X3, cross_att, cross_ent = self.global_cross_attention(
             query=X3,
             key=enc_out,
