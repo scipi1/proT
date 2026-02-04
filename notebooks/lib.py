@@ -10,6 +10,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 from os import makedirs
 from os.path import join
 from torchmetrics.regression import R2Score, MeanSquaredError, MeanAbsoluteError
@@ -87,8 +88,23 @@ def eval_df_torchmetrics(
 def plot_predictions(
     sample_id: int, var_index: int, x_index: int, val_index: int, target_array: np.ndarray, 
     output_array: np.ndarray, title_map: dict=None, 
-    save_dir: str=None, tag: str=None):
+    save_dir: str=None, tag: str=None, plot_target: bool=True):
+    """
+    Plot predictions for a given sample, split by variables.
     
+    Args:
+        sample_id: Index of the sample to plot
+        var_index: Index in target_array for variable ID
+        x_index: Index in target_array for x-axis (position)
+        val_index: Index in target_array for values
+        target_array: Target data array (used for variable/position info even if not plotting target)
+        output_array: Model predictions array
+        title_map: Optional mapping from variable ID to title string
+        save_dir: Optional directory to save figure
+        tag: Optional tag for filename
+        plot_target: If True (default), plots target alongside prediction. 
+                     If False, only plots prediction (useful for external inference).
+    """
     vars = np.unique(target_array[:,:,var_index])
     vars = vars[~np.isnan(vars)]
     num_vars = len(vars)
@@ -112,8 +128,11 @@ def plot_predictions(
     value *= 10
     target[:, :, val_index] *= 10
     
-    # get min and max value for xaxis_lim
-    c = np.concatenate([value[sample_id],target[sample_id, :, val_index]])
+    # get min and max value for y-axis limits
+    if plot_target:
+        c = np.concatenate([value[sample_id], target[sample_id, :, val_index]])
+    else:
+        c = value[sample_id]
     d = c[~(np.isnan(c))]
     min_val = np.min(d)
     max_val = np.max(d)
@@ -132,24 +151,29 @@ def plot_predictions(
         
         ax = fig.add_subplot(gs[i])
         ax.plot(x, y_out, label="prediction")
-        ax.plot(x, y_trg, label="target")
+        if plot_target:
+            ax.plot(x, y_trg, label="target")
         ax.set_ylabel(r"$\Delta R [\%]$")
         ax.set_xlabel("Position")
         ax.set_xlim(0,x[~np.isnan(x)][-1])
         ax.set_ylim(min_val, max_val)
         
-        # Compute metrics on NORMALIZED data (matching compute_prediction_metrics)
-        mask = torch.logical_not(torch.tensor(y_trg_norm).isnan())
-        df_met = eval_df_torchmetrics(
-            y_pred=torch.tensor(y_out_norm).unsqueeze(0).unsqueeze(-1), 
-            y_true=torch.tensor(y_trg_norm).unsqueeze(0).unsqueeze(-1), 
-            mask=mask.unsqueeze(0))
-        mae = df_met.loc[0,"MAE"]
-        r2 = df_met.loc[0,"R2"]
-        
+        # Set title (with or without metrics depending on plot_target)
         title = (title_map[var]) if title_map is not None else var
         
-        ax.set_title(f"{title}: MAE={mae:.2f}, R2={r2:.2f}")
+        if plot_target:
+            # Compute metrics on NORMALIZED data (matching compute_prediction_metrics)
+            mask = torch.logical_not(torch.tensor(y_trg_norm).isnan())
+            df_met = eval_df_torchmetrics(
+                y_pred=torch.tensor(y_out_norm).unsqueeze(0).unsqueeze(-1), 
+                y_true=torch.tensor(y_trg_norm).unsqueeze(0).unsqueeze(-1), 
+                mask=mask.unsqueeze(0))
+            mae = df_met.loc[0,"MAE"]
+            r2 = df_met.loc[0,"R2"]
+            ax.set_title(f"{title}: MAE={mae:.2f}, R2={r2:.2f}")
+        else:
+            ax.set_title(f"{title}")
+        
         ax.legend()
     
     # optional export
@@ -370,6 +394,7 @@ def plot_predictions_enhanced(
             # Minimal styling
             ax_inset.set_xlabel("MAE")
             ax_inset.set_ylabel("")
+            ax_inset.set_yscale("log")
             ax_inset.set_yticks([])
             ax_inset.set_xticklabels([])  # Remove x-axis labels
             ax_inset.spines['top'].set_visible(False)
@@ -671,3 +696,154 @@ def plot_predictions_adaptive(
         fig.savefig(out_path, format="pdf", bbox_inches="tight")
     
     plt.show()
+
+
+def plot_attention_heatmap(
+    sample_id: int,
+    cross_attention: np.ndarray,
+    input_array: np.ndarray,
+    val_index: int,
+    title: str = "Cross-Attention",
+    sum_heads: bool = True,
+    cmap: str = 'viridis',
+    save_dir: str = None,
+    tag: str = None
+):
+    """
+    Plot cross-attention heatmap for a single sample with input missing mask.
+    
+    Creates a two-part figure:
+    - Top: Main attention heatmap (decoder queries x encoder keys)
+    - Bottom: Input missing values mask strip
+    
+    Args:
+        sample_id: Index of the sample to plot
+        cross_attention: Attention weights array from results.attention_weights['cross']
+                        Shape can be (B, N, M) or (B, H, N, M) for multi-head
+        input_array: Input data array (B, L, F) for computing missing mask
+        val_index: Feature index to check for missing values (NaN)
+        title: Title for the plot
+        sum_heads: If True and multi-head attention, sum across heads. 
+                   If False, uses first head only.
+        cmap: Colormap for attention heatmap (default: 'viridis')
+        save_dir: Optional directory to save figure
+        tag: Optional tag for filename
+    """
+    # Handle attention array dimensions
+    # Expected: (B, N, M) for single-head or (B, H, N, M) for multi-head
+    att = cross_attention.copy()
+    
+    # Ensure at least 3D
+    if len(att.shape) == 2:
+        # (N, M) -> assume single sample, add batch dim
+        att = att[np.newaxis, :, :]
+    
+    # Extract sample
+    if len(att.shape) == 4:
+        # Multi-head: (B, H, N, M)
+        if sum_heads:
+            # Sum across head dimension
+            att_sample = att[sample_id].sum(axis=0)  # (N, M)
+            title_suffix = " (Summed Across Heads)"
+        else:
+            # Use first head
+            att_sample = att[sample_id, 0, :, :]  # (N, M)
+            title_suffix = " (Head 0)"
+    elif len(att.shape) == 3:
+        # Single head or pre-aggregated: (B, N, M)
+        att_sample = att[sample_id]  # (N, M)
+        title_suffix = ""
+    else:
+        raise ValueError(f"Unexpected attention shape: {att.shape}. Expected 3D or 4D array.")
+    
+    N, M = att_sample.shape
+    
+    # Compute input missing mask
+    # input_array shape: (B, L, F)
+    input_sample = input_array[sample_id, :, val_index]  # (L,)
+    input_miss_bool = np.isnan(input_sample)
+    input_miss = input_miss_bool[np.newaxis, :].astype(int)  # (1, M)
+    
+    # Create figure with gridspec (10:1 height ratio)
+    fig = plt.figure(figsize=(8, 6))
+    gs = gridspec.GridSpec(2, 1, height_ratios=[10, 1], hspace=0.3)
+    
+    # === Main Attention Heatmap ===
+    ax0 = fig.add_subplot(gs[0])
+    divider0 = make_axes_locatable(ax0)
+    cax0 = divider0.append_axes("right", size="5%", pad=0.1)
+    
+    im0 = ax0.imshow(att_sample, cmap=cmap, aspect='auto', origin='upper')
+    fig.colorbar(im0, cax=cax0, label='Attention Weight')
+    
+    ax0.set_xticks([])  # Hide x-ticks (shared with mask below)
+    ax0.set_ylabel("Output Position (Decoder)")
+    ax0.set_title(f"{title}{title_suffix}")
+    
+    # === Input Missing Mask ===
+    ax1 = fig.add_subplot(gs[1], sharex=ax0)
+    divider1 = make_axes_locatable(ax1)
+    cax1 = divider1.append_axes("right", size="5%", pad=0.1)
+    
+    im1 = ax1.imshow(input_miss, cmap='Greys', aspect='auto', origin='upper', vmin=0, vmax=1)
+    cbar1 = fig.colorbar(im1, cax=cax1, ticks=[0, 1])
+    cbar1.ax.set_yticklabels(['Valid', 'Missing'])
+    
+    ax1.set_yticks([])
+    ax1.set_xlabel("Input Position (Encoder)")
+    
+    # Set x-ticks
+    num_labels = min(M, 10)
+    step = max(M // num_labels, 1)
+    ax1.set_xticks(np.arange(0, M, step))
+    ax1.set_xticklabels(np.arange(0, M, step))
+    
+    plt.tight_layout()
+    
+    # Optional export
+    if save_dir is not None:
+        makedirs(save_dir, exist_ok=True)
+        tag_str = f"_{tag}" if tag is not None else ""
+        filename = f"attention_sample_{sample_id}{tag_str}.pdf"
+        out_path = join(save_dir, filename)
+        fig.savefig(out_path, format="pdf", bbox_inches="tight")
+        print(f"Saved attention heatmap to {out_path}")
+    
+    plt.show()
+
+
+
+
+import re
+import os
+from omegaconf import OmegaConf
+import json
+def get_config_and_best_checkpoint_from_experiment(exp_path):
+    
+    # get config
+    config_regex = re.compile("config")
+    
+    config_list = []
+    for file in os.listdir(exp_path):
+        
+        if config_regex.match(file):
+            config_list.append(file)
+    
+    if len(config_list) != 1:
+        raise ValueError(f"More (or none) than one config found! {config_list}")
+    else:
+        config = OmegaConf.load(os.path.join(exp_path, config_list[0]))
+    
+    with open(os.path.join(exp_path, "kfold_summary.json")) as f:
+        kfold_summary = json.load(f)
+    
+    
+    best_checkpoint_path = os.path.join(
+        exp_path,
+        f"k_{kfold_summary["best_fold"]["fold_number"]}",
+        "checkpoints",
+        "best_checkpoint.ckpt"
+    )
+        
+        
+    return config, best_checkpoint_path

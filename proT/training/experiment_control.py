@@ -87,6 +87,7 @@ def calculate_concat_dim(config, embed_prefix: str, modules_path: str) -> int:
         "variable": f"{embed_prefix}_var_emb_hidden", 
         "position": f"{embed_prefix}_pos_emb_hidden",
         "time": f"{embed_prefix}_time_emb_hidden",
+        "noise": f"{embed_prefix}_time_emb_hidden", # For Ishigami, borrowed time hidden dimension
         "online_pos_mask": f"{embed_prefix}_val_given_emb_hidden",  # For adaptive models
     }
     

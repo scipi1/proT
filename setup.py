@@ -12,7 +12,7 @@ setup(
     name="proT",
     version="0.1.0",
     description="Process Transformer for sequence prediction",
-    author="Your Name",
+    author="Francesco Scipione",
     packages=find_packages(),
     python_requires=">=3.8",
     # No install_requires - dependencies managed separately in requirements.txt

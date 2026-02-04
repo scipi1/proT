@@ -43,9 +43,6 @@ def main():
         debug_flag=debug_flag,
         zero_flag= zero_flag)
     
-    breakpoint()
-    
-    
     #conditioned
     predict_many_masks_input(
             exp_id=exp_id,

@@ -344,7 +344,7 @@ if __name__ == "__main__":
     import re
     
     ROOT_DIR = dirname(dirname(dirname(abspath(__file__))))
-    exp_dir = join(ROOT_DIR, "experiments/miss_vals/miss_vals_proT_ishigami_sum")
+    exp_dir = join(ROOT_DIR, "experiments/fusion/fusion_proT_ishigami_noisy_cat")
     data_dir = join(ROOT_DIR, "data/input/")
     
     # look for config file

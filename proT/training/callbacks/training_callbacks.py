@@ -175,11 +175,13 @@ class MemoryLoggerCallback(Callback):
         
 class GradientLogger(Callback):
     """
-    Logs ‖∇θ‖₂ and variance layer‑by‑layer.
-    Optionally stores raw gradients as .pt files.
+    Logs gradient statistics (L2 norm) for each model parameter.
+    
+    Useful for debugging training issues and monitoring gradient flow through
+    the network. Can help identify vanishing or exploding gradients.
     """
     def __init__(self):
-        super().__init__()        
+        super().__init__()
 
     @staticmethod
     def _stats(t: torch.Tensor):
@@ -225,6 +227,12 @@ class GradientLogger(Callback):
         
 
 class MetricsAggregator(Callback):
+    """
+    Aggregates and logs all callback metrics at the end of each training epoch.
+    
+    Ensures all metrics are logged together in a single step for consistent
+    logging with the trainer's logger.
+    """
     def on_train_epoch_end(self, trainer, pl_module):
         trainer.logger.log_metrics(
             trainer.callback_metrics,           # one dense dict
@@ -308,8 +316,24 @@ class AttentionEntropyLogger(Callback):
 
 
 class LayerRowStats(Callback):
+    """
+    Tracks weight drift statistics for embedding lookup tables during training.
     
-    def __init__(self,layer_name: str=None):
+    Monitors how embedding weights change over training, separately tracking:
+    - Active rows (seen during training)
+    - Inactive rows (never accessed)
+    - Rows associated with missing values
+    
+    Useful for analyzing embedding learning dynamics in transformer models.
+    
+    Args:
+        layer_name: Name of the layer to track. Supported values:
+            - 'encoder_variable': Variable embedding layer
+            - 'encoder_position': Position embedding layer
+            - 'final_ff': Final feedforward layer
+            - None: Defaults to encoder_variable
+    """
+    def __init__(self, layer_name: str = None):
         super().__init__()
         
         self.layer_name = layer_name

@@ -361,10 +361,22 @@ def main():
     
     
     
-def check_nan(tensor, name):
+def check_nan(tensor: torch.Tensor, name: str) -> None:
+    """
+    Debug helper to detect NaN values in tensors during training.
+    
+    If NaN values are found, raises a RuntimeError with diagnostic info.
+    
+    Args:
+        tensor: Tensor to check for NaN values
+        name: Descriptive name for the tensor (used in error message)
+        
+    Raises:
+        RuntimeError: If NaN values are detected in the tensor
+    """
     if torch.isnan(tensor).any():
-        print(f"NaN detected in {name}")
-        breakpoint()
+        nan_count = torch.isnan(tensor).sum().item()
+        raise RuntimeError(f"NaN detected in {name}: {nan_count} NaN values found")
     
 if __name__ == "__main__":
     main()

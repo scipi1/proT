@@ -1,3 +1,4 @@
+from typing import List, Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,15 +11,33 @@ from extra_layers import Normalization
 
 
 class EncoderLayer(nn.Module):
+    """
+    Single encoder layer with self-attention and feedforward network.
+    
+    Implements a pre-norm Transformer encoder layer architecture:
+    1. Self-attention over input sequence
+    2. Position-wise feedforward network
+    
+    Each sub-layer includes residual connections and dropout.
+    
+    Args:
+        global_attention: Attention module for self-attention
+        d_model_enc: Encoder model dimension
+        activation: Activation function type ('relu' or 'gelu')
+        norm: Normalization method for layer normalization
+        d_ff: Feedforward network hidden dimension
+        dropout_ff: Dropout rate for feedforward layers
+        dropout_attn_out: Dropout rate for attention output
+    """
     def __init__(
         self,
-        global_attention,
-        d_model_enc,  
-        activation,         
-        norm, 
-        d_ff,                 
-        dropout_ff,            
-        dropout_attn_out
+        global_attention: nn.Module,
+        d_model_enc: int,  
+        activation: str,         
+        norm: str, 
+        d_ff: int,                 
+        dropout_ff: float,            
+        dropout_attn_out: float
         ):
         super().__init__()
         
@@ -47,11 +66,27 @@ class EncoderLayer(nn.Module):
     def forward(
         self, 
         X: torch.Tensor, 
-        mask_miss_k: torch.Tensor, 
-        mask_miss_q: torch.Tensor, 
-        enc_input_pos: torch.Tensor,
-        causal_mask: bool):
+        mask_miss_k: Optional[torch.Tensor], 
+        mask_miss_q: Optional[torch.Tensor], 
+        enc_input_pos: Optional[torch.Tensor],
+        causal_mask: bool
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Forward pass through the encoder layer.
         
+        Args:
+            X: Input tensor (B, L, d_model_enc)
+            mask_miss_k: Missing value mask for keys (B, L, 1)
+            mask_miss_q: Missing value mask for queries (B, L, 1)
+            enc_input_pos: Position tensor for causal masking (B, L, 1)
+            causal_mask: Whether to apply causal masking
+            
+        Returns:
+            Tuple containing:
+                - encoder_out: Encoder layer output (B, L, d_model_enc)
+                - attn: Self-attention weights
+                - ent: Self-attention entropy
+        """
         # uses pre-norm Transformer architecture
         
         not_mask_miss_q = ~mask_miss_q if mask_miss_q is not None else None
@@ -92,10 +127,21 @@ class EncoderLayer(nn.Module):
     
     
 class Encoder(nn.Module):
+    """
+    Transformer encoder consisting of stacked encoder layers.
+    
+    Processes input sequences through self-attention and feedforward networks.
+    Supports optional final layer normalization and embedding dropout.
+    
+    Args:
+        encoder_layers: List of EncoderLayer modules
+        norm_layer: Optional final normalization layer
+        emb_dropout: Dropout rate applied to input embeddings
+    """
     def __init__(
         self,
-        encoder_layers: int,
-        norm_layer: nn.Module,
+        encoder_layers: List[EncoderLayer],
+        norm_layer: Optional[nn.Module],
         emb_dropout: float,
     ):
         super().__init__()
@@ -106,11 +152,27 @@ class Encoder(nn.Module):
     def forward(
         self, 
         X: torch.Tensor, 
-        mask_miss_k: torch.Tensor, 
-        mask_miss_q: torch.Tensor,
-        enc_input_pos: torch.Tensor,
-        causal_mask: bool):
+        mask_miss_k: Optional[torch.Tensor], 
+        mask_miss_q: Optional[torch.Tensor],
+        enc_input_pos: Optional[torch.Tensor],
+        causal_mask: bool
+        ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
+        """
+        Forward pass through all encoder layers.
         
+        Args:
+            X: Input tensor (B, L, d_model_enc)
+            mask_miss_k: Missing value mask for keys
+            mask_miss_q: Missing value mask for queries
+            enc_input_pos: Position tensor for causal masking
+            causal_mask: Whether to apply causal masking
+            
+        Returns:
+            Tuple containing:
+                - X: Final encoder output (B, L, d_model_enc)
+                - attn_list: List of attention weights from each layer
+                - ent_list: List of attention entropies from each layer
+        """
         X = self.emb_dropout(X)
 
         attn_list, ent_list = [], []

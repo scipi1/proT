@@ -1,4 +1,5 @@
 import warnings
+from typing import List, Tuple, Optional
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,30 +19,52 @@ from datetime import datetime
 ROOT_DIR = dirname(dirname(dirname(abspath(__file__))))
 DUMP_DIR = join(ROOT_DIR,"dump")
 
-# Get the current date and time
-def time_name(filename):
+def time_name(filename: str) -> str:
+    """
+    Generate a timestamped filename.
+    
+    Args:
+        filename: Base filename to append timestamp to
+        
+    Returns:
+        Filename with timestamp suffix in format 'filename_YYYYMMDD_HHMMSS'
+    """
     now = datetime.now()
-
-    # Format it as YYYYMMDD_HHMMSS (or adjust as needed)
     timestamp = now.strftime("%Y%m%d_%H%M%S")
-
-    # Create a filename with the timestamp
-    return filename+f"_{timestamp}"
+    return filename + f"_{timestamp}"
 
 
 class DecoderLayer(nn.Module):
+    """
+    Single decoder layer with self-attention, cross-attention, and feedforward network.
+    
+    Implements a pre-norm Transformer decoder layer architecture:
+    1. Self-attention over decoder inputs
+    2. Cross-attention between decoder and encoder outputs
+    3. Position-wise feedforward network
+    
+    Each sub-layer includes residual connections and dropout.
+    
+    Args:
+        global_self_attention: Attention module for self-attention
+        global_cross_attention: Attention module for cross-attention with encoder
+        d_model_dec: Decoder model dimension
+        activation: Activation function type ('relu' or 'gelu')
+        norm: Normalization method for layer normalization
+        d_ff: Feedforward network hidden dimension
+        dropout_ff: Dropout rate for feedforward layers
+        dropout_attn_out: Dropout rate for attention output
+    """
     def __init__(
         self,
-        global_self_attention,
-        global_cross_attention,
-        d_model_dec,
-        # d_yt, #(??) #TODO don't need them?
-        # d_yc, #(??)
-        activation,
-        norm,
-        d_ff,
-        dropout_ff,
-        dropout_attn_out,
+        global_self_attention: nn.Module,
+        global_cross_attention: nn.Module,
+        d_model_dec: int,
+        activation: str,
+        norm: str,
+        d_ff: int,
+        dropout_ff: float,
+        dropout_attn_out: float,
         ):
         super(DecoderLayer, self).__init__()
         
@@ -67,16 +90,37 @@ class DecoderLayer(nn.Module):
         
         
     def forward(
-        self, X: torch.Tensor, 
+        self, 
+        X: torch.Tensor, 
         enc_out: torch.Tensor, 
-        self_mask_miss_k: torch.Tensor, 
-        self_mask_miss_q: torch.Tensor,
-        cross_mask_miss_k: torch.Tensor, 
-        cross_mask_miss_q: torch.Tensor,
-        dec_input_pos: torch.Tensor,
+        self_mask_miss_k: Optional[torch.Tensor], 
+        self_mask_miss_q: Optional[torch.Tensor],
+        cross_mask_miss_k: Optional[torch.Tensor], 
+        cross_mask_miss_q: Optional[torch.Tensor],
+        dec_input_pos: Optional[torch.Tensor],
         causal_mask: bool
-        ):
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Forward pass through the decoder layer.
         
+        Args:
+            X: Decoder input tensor (B, L, d_model_dec)
+            enc_out: Encoder output tensor (B, S, d_model_enc)
+            self_mask_miss_k: Missing value mask for self-attention keys (B, L, 1)
+            self_mask_miss_q: Missing value mask for self-attention queries (B, L, 1)
+            cross_mask_miss_k: Missing value mask for cross-attention keys (B, S, 1)
+            cross_mask_miss_q: Missing value mask for cross-attention queries (B, L, 1)
+            dec_input_pos: Position tensor for causal masking (B, L, 1)
+            causal_mask: Whether to apply causal masking in self-attention
+            
+        Returns:
+            Tuple containing:
+                - decoder_out: Decoder layer output (B, L, d_model_dec)
+                - self_att: Self-attention weights
+                - cross_att: Cross-attention weights
+                - self_ent: Self-attention entropy
+                - cross_ent: Cross-attention entropy
+        """
         not_self_mask_miss_q = ~self_mask_miss_q if self_mask_miss_q is not None else None
         
         X1 = self.norm1(X, not_self_mask_miss_q)
@@ -126,10 +170,22 @@ class DecoderLayer(nn.Module):
     
     
 class Decoder(nn.Module):
+    """
+    Transformer decoder consisting of stacked decoder layers.
+    
+    Processes target sequences by attending to both the target sequence (self-attention)
+    and the encoder output (cross-attention). Supports optional final layer normalization
+    and embedding dropout.
+    
+    Args:
+        decoder_layers: List of DecoderLayer modules
+        norm_layer: Optional final normalization layer
+        emb_dropout: Dropout rate applied to input embeddings
+    """
     def __init__(
         self, 
-        decoder_layers: int, 
-        norm_layer: nn.Module, 
+        decoder_layers: List[DecoderLayer], 
+        norm_layer: Optional[nn.Module], 
         emb_dropout: float):
         
         super().__init__()
@@ -138,16 +194,37 @@ class Decoder(nn.Module):
         self.emb_dropout = nn.Dropout(emb_dropout)
 
     def forward(
-        self, X: torch.Tensor, 
+        self, 
+        X: torch.Tensor, 
         enc_out: torch.Tensor, 
-        self_mask_miss_k: torch.Tensor, 
-        self_mask_miss_q: torch.Tensor,
-        cross_mask_miss_k: torch.Tensor, 
-        cross_mask_miss_q: torch.Tensor,
-        dec_input_pos: torch.Tensor,
+        self_mask_miss_k: Optional[torch.Tensor], 
+        self_mask_miss_q: Optional[torch.Tensor],
+        cross_mask_miss_k: Optional[torch.Tensor], 
+        cross_mask_miss_q: Optional[torch.Tensor],
+        dec_input_pos: Optional[torch.Tensor],
         causal_mask: bool
-        ):
+        ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+        """
+        Forward pass through all decoder layers.
         
+        Args:
+            X: Decoder input tensor (B, L, d_model_dec)
+            enc_out: Encoder output tensor (B, S, d_model_enc)
+            self_mask_miss_k: Missing value mask for self-attention keys
+            self_mask_miss_q: Missing value mask for self-attention queries
+            cross_mask_miss_k: Missing value mask for cross-attention keys
+            cross_mask_miss_q: Missing value mask for cross-attention queries
+            dec_input_pos: Position tensor for causal masking
+            causal_mask: Whether to apply causal masking
+            
+        Returns:
+            Tuple containing:
+                - X: Final decoder output (B, L, d_model_dec)
+                - self_att_list: List of self-attention weights from each layer
+                - cross_att_list: List of cross-attention weights from each layer
+                - self_enc_list: List of self-attention entropies from each layer
+                - cross_enc_list: List of cross-attention entropies from each layer
+        """
         X = self.emb_dropout(X)
 
         self_att_list, cross_att_list = [], []

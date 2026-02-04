@@ -1,3 +1,4 @@
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,20 +11,58 @@ import numpy as np
 
 
 class ScaleNorm(nn.Module):
-    def __init__(self, dim, eps=1e-5):
+    """
+    Scale normalization layer.
+    
+    Normalizes input by its L2 norm scaled by sqrt(dim), with a learnable gain parameter.
+    More stable than LayerNorm for some architectures.
+    
+    Args:
+        dim: Feature dimension for scaling factor computation
+        eps: Small value for numerical stability
+    """
+    def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.scale = dim**-0.5
         self.g = nn.Parameter(torch.ones(1))
         self.eps = eps
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply scale normalization.
+        
+        Args:
+            x: Input tensor (*, D)
+            
+        Returns:
+            Normalized tensor with same shape as input
+        """
         n = torch.norm(x, dim=-1, keepdim=True).clamp(min=self.eps) * self.scale
         x = x / n * self.g
         return x
 
 
 class Normalization(nn.Module):
-    def __init__(self, method, d_model=None):
+    """
+    Flexible normalization wrapper supporting multiple normalization methods.
+    
+    Provides a unified interface for different normalization strategies including
+    standard methods (LayerNorm, BatchNorm) and masked variants that handle
+    missing/padding tokens.
+    
+    Args:
+        method: Normalization method. One of:
+            - 'layer': Standard LayerNorm
+            - 'scale': ScaleNorm
+            - 'batch': Standard BatchNorm1d
+            - 'MBN': MaskedBatchNorm1d
+            - 'MLN': MaskedLayerNorm
+            - 'MBPN': MaskedBatchPowerNorm
+            - 'MLPN': MaskedLayerPowerNorm
+            - 'none': No normalization (identity)
+        d_model: Model dimension (required for most methods)
+    """
+    def __init__(self, method: str, d_model: Optional[int] = None):
         super().__init__()
         assert method in ["layer", "scale", "batch", "power", "MBN", "MLN", "MBPN", "MLPN","none"]
         if method == "layer":
@@ -77,10 +116,16 @@ def NoNorm(x,*args, **kwargs):
 
 
 class UniformAttentionMask(nn.Module):
+    """
+    Applies uniform masking to attention scores.
+    
+    Sets masked positions to negative infinity (or specified value) so that
+    softmax produces zero attention weights for those positions.
+    """
     def __init__(self) -> None:
         super(UniformAttentionMask,self).__init__()
     
-    def forward(self, attention_scores:torch.Tensor, mask:torch.Tensor,mask_val=-float("inf")):
+    def forward(self, attention_scores: torch.Tensor, mask: torch.Tensor, mask_val: float = -float("inf")) -> torch.Tensor:
         """
         Applies masking to the attention scores.
         
@@ -110,10 +155,16 @@ class UniformAttentionMask(nn.Module):
         return attention_scores.masked_fill(mask, mask_val)
     
 class NAIMAttentionMask(nn.Module):
+    """
+    NAIM-style attention mask that handles NaN values in attention scores.
+    
+    Replaces NaN values in attention scores with negative infinity to prevent
+    propagation of invalid values through the attention mechanism.
+    """
     def __init__(self) -> None:
         super().__init__()
     
-    def forward(self, attention_scores:torch.Tensor, mask:torch.Tensor,mask_val=-torch.inf):
+    def forward(self, attention_scores: torch.Tensor, mask: torch.Tensor, mask_val: float = -torch.inf) -> torch.Tensor:
         """
         Applies masking to the attention scores.
         
@@ -146,7 +197,17 @@ class NAIMAttentionMask(nn.Module):
     
     
 class MaskedLayerNorm(nn.Module):
-    def __init__(self, hidden_dim, eps=1e-5):
+    """
+    Layer normalization that excludes padding tokens from statistics computation.
+    
+    Computes mean and variance only over non-masked (real) tokens, then applies
+    standard layer normalization formula with learnable scale and shift.
+    
+    Args:
+        hidden_dim: Feature dimension for normalization
+        eps: Small value for numerical stability
+    """
+    def __init__(self, hidden_dim: int, eps: float = 1e-5):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_dim))
         self.bias   = nn.Parameter(torch.zeros(hidden_dim))
@@ -169,12 +230,22 @@ class MaskedLayerNorm(nn.Module):
 
         x_hat = (x*m - mean) / torch.sqrt(var + self.eps)
         
-        breakpoint()
         return self.weight * x_hat + self.bias
     
     
 class MaskedLayerPowerNorm(nn.Module):
-    def __init__(self, d_model, p_init=2.0, eps=1e-5):
+    """
+    Layer-style PowerNorm that excludes padding tokens from statistics.
+    
+    Uses learnable power parameter p for Lp normalization instead of L2,
+    computing statistics only over non-masked tokens.
+    
+    Args:
+        d_model: Feature dimension for normalization
+        p_init: Initial value for the power parameter
+        eps: Small value for numerical stability
+    """
+    def __init__(self, d_model: int, p_init: float = 2.0, eps: float = 1e-5):
         super().__init__()
         self.gamma  = nn.Parameter(torch.ones(d_model))
         self.beta   = nn.Parameter(torch.zeros(d_model))
@@ -199,8 +270,6 @@ class MaskedLayerPowerNorm(nn.Module):
 
         x_norm = (x - mu_token) / (sigma_p + self.eps)
         
-        
-        breakpoint()
         return self.gamma * x_norm + self.beta
     
     
@@ -293,9 +362,6 @@ class MaskedBatchPowerNorm(nn.Module):
 
         if self.training and visible.numel():
             pow_batch = (visible.abs().pow(p).mean(dim=0) + self.eps).pow(1/p)
-            if pow_batch.isnan().any():
-                print("NaN in pow_batch")
-                breakpoint()
             # EMA update
             self.running_pow = (1-self.momentum)*self.running_pow + self.momentum*pow_batch
             pow_stat = pow_batch

@@ -1,6 +1,38 @@
+# Data directories
 data/
 experiments/
+
+# Virtual environments
 myenv/
 mamba_venv/
-log*
-!log*/
+venv/
+.venv/
+
+# Log files and directories
+logs/
+*.ldjson
+proT/training/logs/
+
+# IDE and workspace files
+*.code-workspace
+.vscode/
+.idea/
+
+# Python build artifacts
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyo
+dist/
+build/
+
+# Trained models (large files - download separately)
+trained_models/*
+!trained_models/README.md
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# Empty config directory
+proT/config/

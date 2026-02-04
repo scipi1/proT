@@ -12,8 +12,23 @@ from proT.baseline.baseline_models import RNN, TCN, MLP, S6
 
 
 class RNNForecaster(pl.LightningModule):
+    """
+    PyTorch Lightning module for baseline sequence models (LSTM, GRU, TCN, MLP, S6).
     
-    def __init__(self, config):
+    Wraps various recurrent and sequential architectures for time series forecasting
+    with automatic training, validation, and testing loops.
+    
+    Supports:
+        - LSTM: Long Short-Term Memory network
+        - GRU: Gated Recurrent Unit network
+        - TCN: Temporal Convolutional Network
+        - MLP: Multi-Layer Perceptron
+        - S6: State Space Sequence model (Mamba-style)
+    
+    Args:
+        config: Configuration dictionary containing model architecture and training settings
+    """
+    def __init__(self, config: dict):
         super().__init__()
         
         self.val_idx = config["data"]["val_idx"]  # value feature index

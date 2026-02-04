@@ -1,7 +1,8 @@
-# ProChain Transformer
+# proT - Transformer for Manufacturing Modeling
 
 ## Overview
-ProChain Transformer is a specialized transformer-based model for time series forecasting, particularly designed for process data. It implements a modified transformer architecture based on the Spacetimeformer (Grigsby et al., 2023) with custom embedding layers, attention mechanisms, and encoder-decoder structures tailored for sequential process data analysis and prediction.
+
+proT is a specialized transformer-based model for manufacturing modeling, particularly designed for process data. It implements a modified transformer architecture based on the Spacetimeformer (Grigsby et al., 2023) with custom embedding layers, attention mechanisms, and encoder-decoder structures tailored for sequential process data analysis and prediction.
 
 The model is capable of handling missing values in time series data and provides interpretable attention mechanisms to understand the relationships between different parts of the process sequence.
 
@@ -36,35 +37,46 @@ The model is capable of handling missing values in time series data and provides
 ## Project Structure
 
 ```
-prochain_transformer/
+proT/
 ├── config/                 # Configuration files
-├── data/                   # Data directory
-│   ├── input/              # Input data
-│   └── output/             # Output data
+├── data/                   # Data directory (gitignored)
 ├── docs/                   # Documentation
-├── experiments/            # Experiment results
+├── experiments/            # Experiment results (gitignored)
 ├── notebooks/              # Jupyter notebooks for analysis
-├── prochain_transformer/   # Main source code
-│   ├── modules/            # Core model components
-│   │   ├── attention.py    # Attention mechanisms
-│   │   ├── decoder.py      # Decoder implementation
-│   │   ├── embedding.py    # Embedding system
-│   │   ├── embedding_layers.py # Base embedding layers
-│   │   ├── encoder.py      # Encoder implementation
-│   │   ├── extra_layers.py # Additional utility layers
-│   │   └── utils.py        # Utility functions
-│   ├── subroutines/        # Task-specific subroutines
-│   ├── callbacks.py        # Training callbacks
+├── proT/                   # Main source code
+│   ├── core/               # Core model architecture
+│   │   ├── model.py        # Main ProT model
+│   │   └── modules/        # Transformer components
+│   │       ├── attention.py    # Attention mechanisms
+│   │       ├── decoder.py      # Decoder implementation
+│   │       ├── embedding.py    # Embedding system
+│   │       ├── embedding_layers.py # Base embedding layers
+│   │       ├── encoder.py      # Encoder implementation
+│   │       ├── extra_layers.py # Additional utility layers
+│   │       └── utils.py        # Utility functions
+│   ├── training/           # Training infrastructure
+│   │   ├── trainer.py      # Training orchestration
+│   │   ├── dataloader.py   # Data loading utilities
+│   │   ├── experiment_control.py # Experiment management
+│   │   ├── forecasters/    # Lightning module wrappers
+│   │   └── callbacks/      # Training callbacks
+│   ├── evaluation/         # Prediction & evaluation
+│   │   ├── predict.py      # Prediction utilities
+│   │   └── predictors/     # Predictor classes
+│   ├── euler_optuna/       # Optuna hyperparameter optimization
+│   ├── euler_sweep/        # Parameter sweep framework
+│   ├── baseline/           # Baseline models (RNN, TCN, MLP, S6)
+│   ├── proj_specific/      # Project-specific code
+│   │   ├── GSA/            # Global sensitivity analysis
+│   │   ├── simulator/      # Trajectory simulator
+│   │   └── subroutines/    # Evaluation subroutines
+│   ├── utils/              # Shared utilities
 │   ├── cli.py              # Command-line interface
-│   ├── dataloader.py       # Data loading utilities
-│   ├── experiment_control.py # Experiment management
-│   ├── forecaster.py       # Lightning module wrapper
-│   ├── kfold_train.py      # K-fold cross-validation
-│   ├── model.py            # Main model definition
-│   ├── predict.py          # Prediction utilities
-│   └── train.py            # Training utilities
-├── scripts/                # Utility scripts
-└── test/                   # Unit tests
+│   └── labels.py           # Constants
+├── scripts/                # Utility scripts for cluster execution
+├── test/                   # Unit and integration tests
+├── trained_models/         # Pre-trained models (download separately)
+└── tutorials/              # Usage tutorials
 ```
 
 ## Installation
@@ -79,8 +91,8 @@ prochain_transformer/
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/prochain_transformer.git
-cd prochain_transformer
+git clone https://github.com/scipi1/proT.git
+cd proT
 ```
 
 2. Create a virtual environment:
@@ -101,6 +113,7 @@ source venv/bin/activate
 4. Install dependencies:
 ```bash
 pip install -r requirements.txt
+pip install -e .
 ```
 
 ## Usage
@@ -112,7 +125,7 @@ The project provides a command-line interface for training and prediction:
 #### Training
 
 ```bash
-python -m prochain_transformer.cli train --exp_id <experiment_id> [--debug] [--cluster] [--resume_checkpoint <checkpoint_path>]
+python -m proT.cli train --exp_id <experiment_id> [--debug] [--cluster] [--resume_checkpoint <checkpoint_path>]
 ```
 
 Options:
@@ -126,7 +139,7 @@ Options:
 #### Prediction
 
 ```bash
-python -m prochain_transformer.cli predict --exp_id <experiment_id> --out_id <output_id> [--checkpoint <checkpoint_path>]
+python -m proT.cli predict --exp_id <experiment_id> --out_id <output_id> [--checkpoint <checkpoint_path>]
 ```
 
 Options:
@@ -143,11 +156,13 @@ The model is configured using YAML files. A typical configuration includes:
 ```yaml
 data:
   dataset: "your_dataset_name"
-  filename_input: "X_np.npy"
-  filename_target: "Y_np.npy"
+  filename_input: "X.npy"
+  filename_target: "Y.npy"
   val_idx: 0  # Index of the value to predict
 
 model:
+  model_object: "proT"  # Options: proT, proT_sim, proT_adaptive
+  
   # Embedding configuration
   ds_embed_enc: {...}
   ds_embed_dec: {...}
@@ -158,9 +173,6 @@ model:
   enc_attention_type: "ScaledDotProduct"
   dec_self_attention_type: "ScaledDotProduct"
   dec_cross_attention_type: "ScaledDotProduct"
-  enc_mask_type: "Uniform"
-  dec_self_mask_type: "Uniform"
-  dec_cross_mask_type: "Uniform"
   n_heads: 4
   causal_mask: true
   
@@ -173,44 +185,30 @@ model:
   d_qk: 32
   activation: "gelu"
   norm: "layer"
-  use_final_norm: true
   out_dim: 1
   
   # Dropout configuration
   dropout_emb: 0.1
-  dropout_data: 0.0
   dropout_attn_out: 0.1
   dropout_ff: 0.1
-  enc_dropout_qkv: 0.1
-  enc_attention_dropout: 0.1
-  dec_self_dropout_qkv: 0.1
-  dec_self_attention_dropout: 0.1
-  dec_cross_dropout_qkv: 0.1
-  dec_cross_attention_dropout: 0.1
 
 training:
   batch_size: 32
   max_epochs: 100
   loss_fn: "mse"
-  base_lr: 0.0001
-  emb_lr: 0.001
-  emb_start_lr: 0.01
-  optimization: 2
-  switch_epoch: 50
-  switch_step: 50
-  warmup_steps: 1000
+  lr: 0.0001
 ```
 
 ## Examples
 
 ### Basic Training Example
 
-1. Prepare your data in NumPy format (X_np.npy for input, Y_np.npy for target)
+1. Prepare your data in NumPy format (X.npy for input, Y.npy for target)
 2. Create a configuration file in the experiments/training/<exp_id> directory
 3. Run the training command:
 
 ```bash
-python -m prochain_transformer.cli train --exp_id your_experiment_id
+python -m proT.cli train --exp_id your_experiment_id
 ```
 
 ### Prediction Example
@@ -218,7 +216,7 @@ python -m prochain_transformer.cli train --exp_id your_experiment_id
 After training, you can generate predictions using:
 
 ```bash
-python -m prochain_transformer.cli predict --exp_id your_experiment_id --out_id your_output_id
+python -m proT.cli predict --exp_id your_experiment_id --out_id your_output_id
 ```
 
 ### Using the Model in Code
@@ -226,25 +224,26 @@ python -m prochain_transformer.cli predict --exp_id your_experiment_id --out_id 
 ```python
 import torch
 import pytorch_lightning as pl
-from prochain_transformer.model import Spacetimeformer
-from prochain_transformer.forecaster import TransformerForecaster
-from prochain_transformer.dataloader import ProcessDataModule
+from omegaconf import OmegaConf
+from proT.core import ProT
+from proT.training.forecasters import SimpleForecaster
+from proT.training import ProcessDataModule
 
 # Load configuration
-config = {...}  # Your model configuration
+config = OmegaConf.load("path/to/config.yaml")
 
 # Create data module
 data_module = ProcessDataModule(
     data_dir="path/to/data",
-    input_file="X_np.npy",
-    target_file="Y_np.npy",
+    input_file="X.npy",
+    target_file="Y.npy",
     batch_size=32,
     num_workers=4,
     data_format="float32"
 )
 
 # Create model
-model = TransformerForecaster(config)
+model = SimpleForecaster(config)
 
 # Train model (using PyTorch Lightning)
 trainer = pl.Trainer(max_epochs=100)
@@ -254,8 +253,75 @@ trainer.fit(model, data_module)
 trainer.predict(model, data_module)
 ```
 
+### Using Pre-trained Models
+
+Pre-trained models can be downloaded from [Polybox](https://polybox.ethz.ch/index.php/s/R9xCXwfFbZYs5tq). See `trained_models/README.md` for setup instructions.
+
+```python
+from proT.evaluation import predict_test_from_ckpt
+from omegaconf import OmegaConf
+
+# Load config and run prediction
+config = OmegaConf.load("trained_models/proT_dyconex_sum_200/config.yaml")
+results = predict_test_from_ckpt(
+    config=config,
+    datadir_path="data/input",
+    checkpoint_path="trained_models/proT_dyconex_sum_200/k_0/checkpoints/best_checkpoint.ckpt",
+    dataset_label="test"
+)
+
+# Access results
+print(f"Predictions shape: {results.outputs.shape}")
+print(f"Targets shape: {results.targets.shape}")
+```
+
+## Supported Model Types
+
+| Model | Description | Forecaster |
+|-------|-------------|------------|
+| `proT` | Standard transformer | SimpleForecaster |
+| `proT_sim` | Physics-informed (PINN) | SimulatorForecaster |
+| `proT_adaptive` | Curriculum learning | OnlineTargetForecaster |
+| `LSTM` | Long Short-Term Memory | BaselineForecaster |
+| `GRU` | Gated Recurrent Unit | BaselineForecaster |
+| `TCN` | Temporal Convolutional Network | BaselineForecaster |
+| `MLP` | Multi-Layer Perceptron | BaselineForecaster |
+
+## Documentation
+
+Detailed documentation is available in the following locations:
+- `proT/training/forecasters/FORECASTERS_GUIDE.md` - Guide to forecaster modules
+- `proT/euler_optuna/README_PARALLEL.md` - Parallel hyperparameter optimization
+- `proT/euler_sweep/README.md` - Parameter sweep framework
+- `proT/evaluation/README.md` - Prediction system documentation
+- `test/README.md` - Testing guide
+- `tutorials/tutorial_external_prediction.ipynb` - External prediction tutorial
+
+## Testing
+
+Run the test suite:
+
+```bash
+# All tests
+pytest test/ -v
+
+# Unit tests only (fast)
+pytest test/unit/ -v
+
+# Integration tests only
+pytest test/integration/ -v
+```
+
 ## References
 
 - Vaswani, A., et al. (2017). "Attention is all you need." Advances in neural information processing systems.
 - Kazemi, S. M., et al. (2019). "Time2Vec: Learning a Vector Representation of Time." arXiv preprint arXiv:1907.05321.
 - Grigsby, J., et al. (2023). "Spacetimeformer: High-dimensional time series forecasting with self-attention." arXiv preprint.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Citation
+
+[Add citation information for the paper here]

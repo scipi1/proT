@@ -132,8 +132,17 @@ class TransformerForecaster(pl.LightningModule):
     
     
     
-    def _step(self, batch, stage: str=None):
+    def _step(self, batch, stage: str = None):
+        """
+        Compute forward pass, loss, and metrics for a single batch.
         
+        Args:
+            batch: Tuple of (input_tensor, target_tensor)
+            stage: Training stage identifier ('train', 'val', or 'test')
+            
+        Returns:
+            Tuple of (loss, predicted_value, target)
+        """
         X, Y = batch
         trg_val = Y[:,:,self.dec_val_idx]
         trg_nan = trg_val.isnan()
@@ -199,7 +208,19 @@ class TransformerForecaster(pl.LightningModule):
     
     
     def training_step(self, batch, batch_idx):
+        """
+        Execute a single training step with manual optimization.
         
+        Handles optimizer switching between phases, gradient clipping,
+        and curriculum learning for target revelation.
+        
+        Args:
+            batch: Tuple of (input_tensor, target_tensor)
+            batch_idx: Index of the current batch
+            
+        Returns:
+            Training loss for the batch
+        """
         # check if epoch is epoch_switch
         if self.current_epoch == self.epoch_show_trg:
             self.show_trg_ = True
@@ -266,6 +287,15 @@ class TransformerForecaster(pl.LightningModule):
     
     
     def split_params(self):
+        """
+        Split model parameters into embedding and non-embedding groups.
+        
+        Used for applying different optimizers/learning rates to embedding
+        layers vs. transformer layers.
+        
+        Returns:
+            Tuple of (embedding_params, other_params) parameter lists
+        """
         enc_emb_params = list(self.model.enc_embedding.embed_modules_list.parameters())
         dec_emb_params = list(self.model.dec_embedding.embed_modules_list.parameters())
         emb_param_ids = {id(p) for p in enc_emb_params + dec_emb_params}
