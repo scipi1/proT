@@ -86,8 +86,8 @@ class DuctileIST(nn.Module):
     def forward(self, model_out: torch.Tensor):
         
         # assign params
-        lam     = 1e-3*torch.relu(model_out[:,0].unsqueeze(-1))
-        beta    = 1.0 + 10.0*torch.relu(model_out[:,1].unsqueeze(-1))
+        lam     = 1e-3*nn.functional.softplus(model_out[:,0].unsqueeze(-1))             # Here it was RELU
+        beta    = 1.0 + 10.0*nn.functional.softplus(model_out[:,1].unsqueeze(-1))       # Here it was RELU
         D       = torch.zeros_like(lam, device=model_out.get_device())
         
         out = []
@@ -114,8 +114,8 @@ class FractureIST(nn.Module):
     def forward(self, transformer_out: torch.Tensor):
         
         # assign params
-        lam     =   1e-3*torch.relu(transformer_out[:,0])           # [bs, 1]
-        beta    =   1.0 + 10.0*torch.relu(transformer_out[:,1])     # [bs, 1]
+        lam     =   1e-3*nn.functional.softplus(transformer_out[:,0])           # [bs, 1] Here it was RELU
+        beta    =   1.0 + 10.0*nn.functional.softplus(transformer_out[:,1])     # [bs, 1] Here it was RELU
         k_d     =   transformer_out[:,2]
         mu      =   transformer_out[:,3]  
         k_f     =   transformer_out[:,4] 

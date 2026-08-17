@@ -11,6 +11,7 @@ from proT.training.forecasters.transformer_forecaster import TransformerForecast
 from proT.training.forecasters.entropy_regularized_forecaster import EntropyRegularizedForecaster
 from proT.training.forecasters.simulator_forecaster import SimulatorForecaster
 from proT.training.forecasters.online_target_forecaster import OnlineTargetForecaster
+from proT.training.forecasters.encoder_forecaster import EncoderForecaster
 
 
 class TransformerPredictor(BasePredictor):
@@ -40,6 +41,7 @@ class TransformerPredictor(BasePredictor):
             "proT": EntropyRegularizedForecaster,
             "proT_sim": SimulatorForecaster,
             "proT_adaptive": OnlineTargetForecaster,
+            "proT_enc": EncoderForecaster,
             "transformer": TransformerForecaster,  # Generic fallback
         }
         
@@ -95,6 +97,8 @@ class TransformerPredictor(BasePredictor):
         forecast_output, recon_output, (enc_self_att, dec_self_att, dec_cross_att), enc_mask, entropy = output
         
         # Extract attention weights (take first head/layer for simplicity)
+        # For encoder-only models (proT_enc), dec_self_att and dec_cross_att are
+        # empty lists; the pooling attention is returned in dec_cross_att.
         attention_weights = {
             'encoder': enc_self_att[0] if enc_self_att else None,
             'decoder': dec_self_att[0] if dec_self_att else None,

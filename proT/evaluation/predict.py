@@ -55,6 +55,7 @@ def create_predictor(
         "proT": TransformerPredictor,
         "proT_sim": TransformerPredictor,
         "proT_adaptive": TransformerPredictor,
+        "proT_enc": TransformerPredictor,
         
         # Baseline models
         "LSTM": BaselinePredictor,

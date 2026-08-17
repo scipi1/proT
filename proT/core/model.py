@@ -28,6 +28,11 @@ class ProT(nn.Module):
         configure a position variable in your embedding configuration. The position
         variable should use "embed": "pass" to pass through to the attention layers
         where it will be used to construct a lower triangular causal mask.
+    
+    Group Masking (encoder self-attention):
+        To enable group masking (enc_group_mask), configure a grouping variable in
+        the encoder embedding configuration with "embed": "group". Tokens will only
+        attend to tokens sharing the same group id (e.g., the same PCB layer).
     """
     def __init__(
         self,
@@ -78,6 +83,8 @@ class ProT(nn.Module):
         d_model_dec: int,
         d_qk: int,
         given_target_max_pos: int = None,
+        freeze_dec_embedding: bool = False,
+        enc_group_mask: bool = False,
         ):
         super().__init__()
         
@@ -91,6 +98,14 @@ class ProT(nn.Module):
             ds_embed=ds_embed_dec,
             comps=comps_embed_dec,
             device=device)
+        
+        # optionally freeze decoder input embeddings to force learning at the encoder.
+        # attention projections, FF layers and encoder embeddings remain trainable.
+        self.freeze_dec_embedding = freeze_dec_embedding
+        if freeze_dec_embedding:
+            for p in self.dec_embedding.parameters():
+                p.requires_grad = False
+            print("Decoder input embeddings frozen (freeze_dec_embedding=True)")
         
         # Select Attention Options
         attn_shared_kwargs = {
@@ -137,6 +152,7 @@ class ProT(nn.Module):
         #self.causal_mask = causal_mask
         self.enc_causal_mask = enc_causal_mask
         self.dec_causal_mask = dec_causal_mask
+        self.enc_group_mask = enc_group_mask
         
         self.encoder = Encoder(
             encoder_layers=[
@@ -193,6 +209,7 @@ class ProT(nn.Module):
         enc_input = self.enc_embedding(X=input_tensor)
         enc_input_pos = self.enc_embedding.pass_var(X=input_tensor) #TODO still relevant?
         enc_mask = self.enc_embedding.get_mask(X=input_tensor)
+        enc_group = self.enc_embedding.get_group_var(X=input_tensor)
         
         if enc_input_pos is None and self.enc_causal_mask == True:
             self.enc_causal_mask = False
@@ -202,13 +219,23 @@ class ProT(nn.Module):
                 f"encoder embedding configuration (ds_embed_enc). Causal mask has been disabled."
             )
         
+        if enc_group is None and self.enc_group_mask == True:
+            self.enc_group_mask = False
+            warnings.warn(
+                f"Encoder group_mask is set to True but encoder received null group ids. "
+                f"To use group masking, you must configure a grouping variable with 'embed': 'group' in the "
+                f"encoder embedding configuration (ds_embed_enc). Group mask has been disabled."
+            )
+        
         # pass embedded input to encoder
         enc_out, enc_self_att, enc_self_ent = self.encoder(
             X=enc_input,
             mask_miss_k=enc_mask,
             mask_miss_q=enc_mask,
             enc_input_pos=enc_input_pos,
-            causal_mask=self.enc_causal_mask
+            causal_mask=self.enc_causal_mask,
+            group_ids=enc_group,
+            group_mask=self.enc_group_mask
             )
         
         # embed target

@@ -69,7 +69,9 @@ class EncoderLayer(nn.Module):
         mask_miss_k: Optional[torch.Tensor], 
         mask_miss_q: Optional[torch.Tensor], 
         enc_input_pos: Optional[torch.Tensor],
-        causal_mask: bool
+        causal_mask: bool,
+        group_ids: Optional[torch.Tensor] = None,
+        group_mask: bool = False
         ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass through the encoder layer.
@@ -80,6 +82,8 @@ class EncoderLayer(nn.Module):
             mask_miss_q: Missing value mask for queries (B, L, 1)
             enc_input_pos: Position tensor for causal masking (B, L, 1)
             causal_mask: Whether to apply causal masking
+            group_ids: Group id tensor for group masking (B, L)
+            group_mask: Whether to apply group masking
             
         Returns:
             Tuple containing:
@@ -103,6 +107,8 @@ class EncoderLayer(nn.Module):
             mask_miss_q=mask_miss_q,
             pos = enc_input_pos,
             causal_mask=causal_mask,
+            group_ids=group_ids,
+            group_mask=group_mask,
             )                    
         
         # resnet
@@ -155,7 +161,9 @@ class Encoder(nn.Module):
         mask_miss_k: Optional[torch.Tensor], 
         mask_miss_q: Optional[torch.Tensor],
         enc_input_pos: Optional[torch.Tensor],
-        causal_mask: bool
+        causal_mask: bool,
+        group_ids: Optional[torch.Tensor] = None,
+        group_mask: bool = False
         ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
         """
         Forward pass through all encoder layers.
@@ -166,6 +174,8 @@ class Encoder(nn.Module):
             mask_miss_q: Missing value mask for queries
             enc_input_pos: Position tensor for causal masking
             causal_mask: Whether to apply causal masking
+            group_ids: Group id tensor for group masking (B, L)
+            group_mask: Whether to apply group masking
             
         Returns:
             Tuple containing:
@@ -183,7 +193,9 @@ class Encoder(nn.Module):
                 mask_miss_k=mask_miss_k, 
                 mask_miss_q=mask_miss_q, 
                 enc_input_pos=enc_input_pos,
-                causal_mask=causal_mask) 
+                causal_mask=causal_mask,
+                group_ids=group_ids,
+                group_mask=group_mask) 
             
             attn_list.append(attn)
             ent_list.append(ent)

@@ -14,12 +14,14 @@ import pytorch_lightning as pl
 import torch
 from pytorch_lightning import Callback, Trainer, LightningModule
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.trainer.states import TrainerFn
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
 
 # Local imports
 ROOT_DIR = dirname(dirname(abspath(__file__)))
 sys.path.append(ROOT_DIR)
 from proT.utils.entropy_utils import get_entropy_registry
+from proT.training.qk_schedule import collect_qk_params, set_requires_grad
 
 
 
@@ -463,14 +465,24 @@ class LayerRowStats(Callback):
 
 class BestCheckpointCallback(Callback):
     """
-    Callback to save the best checkpoint based on val_mae and store associated metrics.
+    Callback to save the best checkpoint based on a monitored metric and store
+    associated metrics.
+
+    Args:
+        save_dir: Directory to save the checkpoint and best_metrics.json
+        monitor: Metric to monitor (default "val_mae")
+        mode: "min" or "max" (default "min")
+        min_epoch: Do not save checkpoints before this epoch. Useful to skip
+            the curriculum phase (teacher forcing) where validation metrics
+            are not comparable to the final autoregressive performance.
     """
     
-    def __init__(self, save_dir: str, monitor: str = "val_mae", mode: str = "min"):
+    def __init__(self, save_dir: str, monitor: str = "val_mae", mode: str = "min", min_epoch: int = 0):
         super().__init__()
         self.save_dir = save_dir
         self.monitor = monitor
         self.mode = mode
+        self.min_epoch = min_epoch
         self.best_metric_value = float('inf') if mode == 'min' else float('-inf')
         self.best_metrics = {}
         self.best_epoch = 0
@@ -489,6 +501,18 @@ class BestCheckpointCallback(Callback):
     
     def on_validation_epoch_end(self, trainer, pl_module):
         """Check if current epoch has the best validation metric and save if so."""
+        # Only track real validation epochs during fit: the sanity check runs
+        # with state.fn == FITTING on the untrained model, and post-fit
+        # trainer.validate() calls (e.g. re-evaluating the best checkpoint)
+        # run with state.fn == VALIDATING. Neither must corrupt the tracked best.
+        if trainer.sanity_checking or trainer.state.fn != TrainerFn.FITTING:
+            return
+
+        # Skip the curriculum phase: metrics are not comparable to the final
+        # autoregressive performance while teacher forcing is active.
+        if trainer.current_epoch < self.min_epoch:
+            return
+
         current_metrics = trainer.logged_metrics
         
         if self.monitor in current_metrics:
@@ -628,3 +652,46 @@ class KFoldResultsTracker:
             with open(self.summary_file, 'r') as f:
                 return json.load(f)
         return {}
+
+
+class QKFreezeScheduler(Callback):
+    """
+    Hard-freeze schedule for attention query/key projections.
+
+    Q/K projections of all AttentionLayer modules (filtered by scope) are
+    frozen (requires_grad=False) for the first `freeze_epochs` epochs and
+    unfrozen afterwards. While frozen, optimizers skip them (grad=None), so
+    learning is driven by embeddings, value/out projections and FF layers.
+    Mutually exclusive with the Q/K LR ramp (config key `qk_lr_ramp`), which
+    is handled in the forecaster's configure_optimizers.
+
+    Args:
+        freeze_epochs: Number of initial epochs with frozen Q/K (0 disables).
+        scope: "all" | "self" | "cross".
+    """
+
+    def __init__(self, freeze_epochs: int, scope: str = "all"):
+        super().__init__()
+        self.freeze_epochs = freeze_epochs
+        self.scope = scope
+        self._qk_params = None
+        self._frozen = None
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        # lazily collect Q/K params once (model must be built already)
+        if self._qk_params is None:
+            self._qk_params = collect_qk_params(pl_module.model, scope=self.scope)
+            if len(self._qk_params) == 0:
+                print("QKFreezeScheduler: no Q/K projections found, callback has no effect.")
+
+        should_freeze = trainer.current_epoch < self.freeze_epochs
+
+        # toggle only on state change (epoch 0 and at the unfreeze epoch)
+        if self._frozen is None or should_freeze != self._frozen:
+            set_requires_grad(self._qk_params, not should_freeze)
+            self._frozen = should_freeze
+            state = "frozen" if should_freeze else "unfrozen"
+            print(
+                f"QKFreezeScheduler: Q/K projections (scope={self.scope}) "
+                f"{state} at epoch {trainer.current_epoch}"
+            )

@@ -369,7 +369,8 @@ def train_function_for_optuna(
         experiment_tag=experiment_tag,
         resume_ckpt=None,
         plot_pred_check=True,
-        debug=False
+        debug=False,
+        best=True  # HPO objective: metrics at the best (val_mae) checkpoint
     )
     
     return df_metric

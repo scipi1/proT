@@ -121,7 +121,46 @@ model = OnlineTargetForecaster(config)
 
 ---
 
-### 4. TransformerForecaster (Legacy/Complex)
+### 4. EncoderForecaster (Encoder-only proT)
+
+**File:** `encoder_forecaster.py`
+
+**Description:** Encoder-only proT variant (`proT_enc`). The transformer encoder processes the input sequence; a learnable query token pools the encoder outputs via attention into a context vector. Two head variants are supported:
+
+- **Scalar head** (`head_type: "scalar"`): predicts a D-dimensional vector of scalar targets per sample (e.g. IST slope, fitting coefficients). The dataset provides the scalar targets directly; the model output is `(B, D, out_dim)`.
+- **GRU head** (`head_type: "gru"`): the context vector initializes the hidden state of a GRU, which is unrolled over the target positions. Per-step inputs are the target covariates (position, variable, value, given-indicator) embedded with the existing `ModularEmbedding`. The value channel is fed with the real target where given (teacher forcing / "real IST" at inference) and with the predicted mean elsewhere (autoregressive rollout).
+
+**Features:**
+- ✅ Probabilistic losses (`PositionWeightedMSE` / `CensoredGaussianNLL`) unchanged
+- ✅ Scheduled curriculum (annealed forcing bound) as in `OnlineTargetForecaster`
+- ✅ "Real IST" at inference via `show_trg_max_idx`
+- ✅ Attention pooling over the encoder outputs (no decoder self/cross attention)
+- ✅ Compatible with the existing trainer, predictor and plotting infrastructure
+
+**Configuration Requirements:**
+```yaml
+model:
+  model_object: "proT_enc"
+  kwargs:
+    head_type: "gru"        # "scalar" | "gru"
+    output_dim: null        # scalar head: number of scalar targets (D)
+    d_hidden: 128           # GRU hidden dimension
+    rnn_n_layers: 1
+    rnn_dropout: 0.0
+    dec_val_idx: 3          # value channel in the target tensor
+    dec_pos_idx: 1          # position channel in the target tensor
+```
+
+**Usage:**
+```python
+from proT.training.forecasters.encoder_forecaster import EncoderForecaster
+
+model = EncoderForecaster(config)
+```
+
+---
+
+### 5. TransformerForecaster (Legacy/Complex)
 
 **File:** `transformer_forecaster.py`
 
@@ -362,3 +401,44 @@ ModuleNotFoundError: No module named 'proT.proj_specific.simulator'
 - ⚠️ **TransformerForecaster**: Legacy, will be simplified
 
 **Recommendation:** Start with `SimpleForecaster` and only move to specialized versions if you have specific requirements.
+
+---
+
+## Optional Learning Controls
+
+Three optional, config-driven training controls are available for all proT
+forecasters (`EntropyRegularizedForecaster`, `SimpleForecaster`,
+`SimulatorForecaster`, `OnlineTargetForecaster`). All default to off, so old
+configs are unaffected.
+
+```yaml
+model:
+  kwargs:
+    # 1) freeze decoder input embeddings to force learning at the encoder
+    freeze_dec_embedding: false     # true = frozen for the whole run
+
+training:
+  # 2) delayed Q/K learning (hard freeze OR linear LR ramp; ramp takes precedence)
+  qk_freeze_scope: "all"            # "all" | "self" | "cross"
+  qk_freeze_epochs: 0               # hard-freeze Q/K projections for N epochs (0 = off)
+  qk_lr_ramp: false                 # linear LR ramp on Q/K projections
+  qk_lr_ramp_start_factor: 1e-4     # Q/K LR starts at lr * start_factor
+  qk_lr_ramp_end_frac: 0.95         # Q/K LR reaches full lr at 95% of max_epochs
+
+  # 3) positional loss weighting (later target positions weigh more)
+  loss_pos_weight: "none"           # "none" | "linear" | "exp"
+  loss_pos_weight_alpha: 2.0        # sharpness for "exp"
+```
+
+**Notes:**
+- `freeze_dec_embedding` freezes the whole decoder embedding module (variable,
+  time2vec, value bias). Attention projections, FF layers and the encoder stay
+  trainable; the decoder self-attention keeps working on the frozen inputs.
+- The Q/K hard freeze is implemented as the `QKFreezeScheduler` callback
+  (registered automatically in `trainer.py`); the LR ramp is a parameter-group
+  `LambdaLR` built in the forecaster's `configure_optimizers`.
+- The MSE loss (`proT/training/losses.py`, `PositionWeightedMSE`) always
+  excludes NaN targets (previously they entered the loss as zeros) and applies
+  mean-normalized position weights, so the loss scale stays comparable to the
+  unweighted case. Metrics (mae/rmse/r2) remain unweighted for comparability.
+- Unit tests: `test/unit/test_learning_options.py`.

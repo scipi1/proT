@@ -31,6 +31,8 @@ class ScaledDotAttention(nn.Module):
         mask_miss_q: torch.Tensor,
         pos: torch.Tensor,
         causal_mask: bool,
+        group_ids: torch.Tensor = None,
+        group_mask: bool = False,
         ):
         
         # Handle both single-head (3D) and multi-head (4D) tensors
@@ -57,6 +59,12 @@ class ScaledDotAttention(nn.Module):
             M_causal = build_causal_mask(pos, n_heads=H)
             
             scores = scores + M_causal
+        
+        # Apply group mask (tokens attend only within the same group)
+        if group_ids is not None and group_mask:
+            M_group = build_group_mask(group_ids, n_heads=H)
+            
+            scores = scores + M_group
         
         # Apply missing data masks
         # masking missing value with -inf to force the softmax to zero
@@ -170,6 +178,38 @@ def build_causal_mask(p: torch.Tensor, n_heads: int = 1) -> torch.Tensor:
     return M
 
 
+def build_group_mask(g: torch.Tensor, n_heads: int = 1) -> torch.Tensor:
+    """
+    Build an additive attention mask that blocks attention between tokens
+    belonging to different groups (e.g., different PCB layers).
+
+    Args:
+        g: (B, L) or (B, L, 1) tensor with the group id of every token.
+           NaN group ids are mapped to a sentinel (-1) so that all
+           unassigned tokens form their own group.
+        n_heads: number of attention heads
+
+    Returns:
+        For single head (n_heads=1): (B, L, L) mask M
+        For multi-head (n_heads>1): (B, H, L, L) mask M
+        with M[b, (h,) i, j] = -inf if g[b, i] != g[b, j], 0 otherwise.
+    """
+    g_flat = torch.nan_to_num(g.squeeze(-1) if g.dim() == 3 else g, nan=-1.0)  # (B, L)
+
+    g_i = g_flat.unsqueeze(-1)  # (B, L, 1)
+    g_j = g_flat.unsqueeze(-2)  # (B, 1, L)
+
+    # Build the additive mask (same dtype/device as `g`)
+    M = torch.zeros_like(g_i.expand(-1, -1, g_flat.size(-1)))
+    M.masked_fill_(g_j != g_i, float("-inf"))
+
+    # Expand for multi-head if needed
+    if n_heads > 1:
+        M = M.unsqueeze(1).expand(-1, n_heads, -1, -1)  # (B, H, L, L)
+
+    return M
+
+
 def calculate_attention_entropy(att_weights: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """
     Calculate entropy of attention weights.
@@ -240,6 +280,8 @@ class AttentionLayer(nn.Module):
         mask_miss_q: torch.Tensor,
         pos: torch.Tensor,
         causal_mask: bool,
+        group_ids: torch.Tensor = None,
+        group_mask: bool = False,
         ):
         
         B, L, _ = query.shape
@@ -264,6 +306,8 @@ class AttentionLayer(nn.Module):
             mask_miss_q=mask_miss_q,
             pos=pos,
             causal_mask=causal_mask,
+            group_ids=group_ids,
+            group_mask=group_mask,
             )
         
         # Reshape output and apply final projection if multi-head

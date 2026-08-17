@@ -10,6 +10,8 @@ import pytorch_lightning as pl
 import torchmetrics as tm
 
 from proT.core.model import ProT
+from proT.training.losses import PositionWeightedMSE
+from proT.training.qk_schedule import configure_adamw_with_qk_ramp
 
 
 class EntropyRegularizedForecaster(pl.LightningModule):
@@ -37,9 +39,12 @@ class EntropyRegularizedForecaster(pl.LightningModule):
         self.config = config
         self.model = ProT(**config["model"]["kwargs"])
         
-        # Loss function
+        # Loss function (position-weighted, NaN-target masked)
         if config["training"]["loss_fn"] == "mse":
-            self.loss_fn = nn.MSELoss(reduction="none")
+            self.loss_fn = PositionWeightedMSE(
+                scheme=config["training"].get("loss_pos_weight", "none"),
+                alpha=config["training"].get("loss_pos_weight_alpha", 2.0),
+            )
         else:
             raise ValueError(f"Unsupported loss function: {config['training']['loss_fn']}")
         
@@ -99,12 +104,11 @@ class EntropyRegularizedForecaster(pl.LightningModule):
         # Forward pass
         forecast_output, _, _, _, (enc_self_ent, dec_self_ent, dec_cross_ent) = self.forward(X, Y)
         
-        # Calculate loss (only on non-NaN values)
-        predicted_value = forecast_output.squeeze()
-        trg = torch.nan_to_num(trg_val).squeeze()
+        # Calculate loss (only valid, non-NaN targets contribute; optional position weighting)
+        predicted_value = forecast_output.squeeze(-1)
+        trg = torch.nan_to_num(trg_val)
         
-        mse_per_elem = self.loss_fn(predicted_value, trg)
-        loss = mse_per_elem.mean()
+        loss = self.loss_fn(predicted_value, trg_val)
         
         # Calculate entropy statistics
         enc_self = torch.concat(enc_self_ent, dim=0).mean()
@@ -156,10 +160,21 @@ class EntropyRegularizedForecaster(pl.LightningModule):
     def configure_optimizers(self):
         """
         Configure AdamW optimizer - simple and effective.
+        Optionally with a linear LR ramp on Q/K projections (qk_lr_ramp).
         
         Returns:
-            AdamW optimizer
+            AdamW optimizer, or ([optimizer], [scheduler]) if qk_lr_ramp is on
         """
+        if self.config["training"].get("qk_lr_ramp", False):
+            return configure_adamw_with_qk_ramp(
+                forecaster=self,
+                base_lr=self.config["training"]["lr"],
+                weight_decay=self.config["training"].get("weight_decay", 0.01),
+                scope=self.config["training"].get("qk_freeze_scope", "all"),
+                max_epochs=self.config["training"]["max_epochs"],
+                end_frac=self.config["training"].get("qk_lr_ramp_end_frac", 0.95),
+                start_factor=self.config["training"].get("qk_lr_ramp_start_factor", 1e-4),
+            )
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.config["training"]["lr"],

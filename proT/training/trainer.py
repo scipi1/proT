@@ -23,9 +23,10 @@ from proT.training.callbacks.training_callbacks import (
     early_stopping_callbacks, get_checkpoint_callback, MemoryLoggerCallback, 
     GradientLogger, LayerRowStats, MetricsAggregator, PerRunManifest, 
     AttentionEntropyLogger, BestCheckpointCallback, DataIndexTracker, 
-    KFoldResultsTracker
+    KFoldResultsTracker, QKFreezeScheduler
 )
 from proT.training.forecasters import *
+from proT.training.forecasters.encoder_forecaster import EncoderForecaster
 from proT.labels import *
 from proT.baseline.baseline_pl_modules import RNNForecaster
 from proT.training.dataloader import ProcessDataModule
@@ -44,7 +45,7 @@ def trainer(
     resume_ckpt: str=None,
     plot_pred_check: bool=False,
     debug: bool=False,
-    best: bool=False,
+    best: bool=True,
     )->pd.DataFrame:
     """
     Training function with k-fold cross-validation
@@ -58,8 +59,10 @@ def trainer(
         resume_ckpt (str, optional): checkpoint to resume training. Defaults to None.
         plot_pred_check (bool, optional): whether to plot prediction check. Defaults to False.
         debug (bool, optional): turn on debug options. Defaults to False.
-        best (bool, optional): if True, use metrics from best checkpoint (based on val_mae), 
-                              if False, use final epoch metrics. Defaults to False.
+        best (bool, optional): if True, evaluate validation and test on the best
+                              checkpoint (based on val_mae) so that kfold_summary
+                              and best_metrics.json are consistent. If False, use
+                              final epoch weights. Defaults to True.
     
     Returns:
         pd.DataFrame: DataFrame containing metrics for each fold
@@ -78,12 +81,16 @@ def trainer(
     # Note: plot_pred_check now works with all model types (proT and baselines)
     
     
+    # num_workers: 0 on Windows to avoid multiprocessing DLL paging-file crashes
+    default_workers = 0 if sys.platform == "win32" else (1 if cluster else 20)
+    num_workers = config["training"].get("num_workers", default_workers)
+    
     dm = ProcessDataModule(
         data_dir                = join(data_dir,config["data"]["dataset"]),
         input_file              = config["data"]["filename_input"],
         target_file             = config["data"]["filename_target"],
         batch_size              =  config["training"]["batch_size"],
-        num_workers             = 1 if cluster else 20, # change it to your local number of workers
+        num_workers             = num_workers,
         data_format             = "float32",
         max_data_size           = config["data"]["max_data_size"],
         input_p_blank           = config["data"].get("input_p_blank", None),
@@ -165,7 +172,15 @@ def trainer(
         manifest_callback  = PerRunManifest(config, path=save_dir_k, tag=experiment_tag)
         
         # Add new callbacks for best checkpoint tracking and data index saving
-        best_checkpoint_callback = BestCheckpointCallback(save_dir_k, monitor="val_mae", mode="min")
+        # For probabilistic losses (gaussian, gaussian_censored), monitor the NLL
+        # instead of the MAE: the NLL accounts for the predicted uncertainty.
+        best_metric = config["training"].get("best_checkpoint_metric", "val_mae")
+        # Skip the curriculum phase: metrics are not comparable to the final
+        # autoregressive performance while teacher forcing is active.
+        min_epoch = config["training"].get("epoch_show_trg", 0) + 1 \
+            if config["training"].get("target_show_mode") is not None else 0
+        best_checkpoint_callback = BestCheckpointCallback(
+            save_dir_k, monitor=best_metric, mode="min", min_epoch=min_epoch)
         data_index_tracker = DataIndexTracker(save_dir_k, fold, train_global_idx, val_global_idx, test_idx)
         
         callbacks_list = [cb for cb in checkpoint_callback]
@@ -176,6 +191,15 @@ def trainer(
         # Add attention entropy logging callback
         entropy_enabled = True
         callbacks_list.append(AttentionEntropyLogger(enabled=entropy_enabled))
+        
+        # Delayed Q/K learning via hard freeze (mutually exclusive with the
+        # Q/K LR ramp, which is handled in the forecaster's configure_optimizers)
+        qk_freeze_epochs = config["training"].get("qk_freeze_epochs", 0)
+        if qk_freeze_epochs > 0 and not config["training"].get("qk_lr_ramp", False):
+            callbacks_list.append(QKFreezeScheduler(
+                freeze_epochs=qk_freeze_epochs,
+                scope=config["training"].get("qk_freeze_scope", "all")
+            ))
         
         if "early_stopping" in config["special"]["mode"]:
             callbacks_list.append(early_stopping_callbacks)
@@ -225,35 +249,39 @@ def trainer(
         num_epochs = trainer.current_epoch + 1
         avg_time_per_epoch = training_time / num_epochs if num_epochs > 0 else 0
 
+        # Determine evaluation checkpoint: with best=True, both validation and
+        # test are evaluated on the best (val_mae) checkpoint, so that
+        # kfold_summary.json and best_metrics.json are consistent. With
+        # best=False, final-epoch weights are used.
+        best_ckpt = best_checkpoint_callback.best_checkpoint_path
+        use_best = best and best_ckpt is not None and os.path.exists(best_ckpt)
+        eval_ckpt = best_ckpt if use_best else None
+
         # validation (only if validation dataset exists)
         if dm.val_ds is not None:
-            trainer.validate(model, dm)
+            trainer.validate(model, dm, ckpt_path=eval_ckpt)
             val_metrics = trainer.callback_metrics.copy()
         else:
             val_metrics = {}
         
-        # test
-        trainer.test(model, dm)
+        # test (on the same checkpoint as validation)
+        trainer.test(model, dm, ckpt_path=eval_ckpt)
         test_metrics = trainer.callback_metrics.copy()
         
-        # Determine which metrics to use based on 'best' parameter
-        if best:
-            # Use metrics from the best checkpoint
+        # Determine which metrics to report
+        if use_best:
+            # on_test_end has written best_metrics.json with consistent
+            # val/train (best epoch) and test (best checkpoint) metrics
             best_metrics_file = join(save_dir_k, "best_metrics.json")
-            if os.path.exists(best_metrics_file):
-                with open(best_metrics_file, 'r') as f:
-                    best_metrics_data = json.load(f)
-                
-                # Extract metrics (excluding metadata like best_epoch, best_checkpoint_path)
-                fold_metrics = {k: v for k, v in best_metrics_data.items() 
-                               if k not in ['best_epoch', 'best_checkpoint_path']}
-                best_checkpoint_path = best_metrics_data.get('best_checkpoint_path')
-            else:
-                # Fallback to current metrics if best not available
-                fold_metrics = {**val_metrics, **test_metrics}
-                best_checkpoint_path = None
+            with open(best_metrics_file, 'r') as f:
+                best_metrics_data = json.load(f)
+            
+            # Extract metrics (keep best_epoch as diagnostics, drop the path)
+            fold_metrics = {k: v for k, v in best_metrics_data.items() 
+                           if k != 'best_checkpoint_path'}
+            best_checkpoint_path = best_metrics_data.get('best_checkpoint_path')
         else:
-            # Use current behavior - final epoch metrics
+            # Final-epoch metrics (also the fallback if no best checkpoint exists)
             fold_metrics = {**val_metrics, **test_metrics}
             best_checkpoint_path = None
         
@@ -311,7 +339,7 @@ def trainer(
 def get_model_object(config: dict)->pl.LightningModule:
     
     model_obj = config["model"]["model_object"]
-    available_models = ["proT", "proT_sim", "proT_adaptive", 
+    available_models = ["proT", "proT_sim", "proT_adaptive", "proT_enc",
                         "LSTM", "GRU", "TCN", "MLP", "S6"]
     
     assert model_obj in available_models, AssertionError(f"{model_obj} unavailable! Choose between {available_models}")
@@ -321,6 +349,7 @@ def get_model_object(config: dict)->pl.LightningModule:
         "proT"          : EntropyRegularizedForecaster,
         "proT_sim"      : SimulatorForecaster,
         "proT_adaptive" : OnlineTargetForecaster,
+        "proT_enc"      : EncoderForecaster,
 
         # BASELINE MODELS
         "GRU"           : RNNForecaster,

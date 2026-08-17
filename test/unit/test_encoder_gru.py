@@ -1,0 +1,291 @@
+"""
+Unit tests for the encoder-only ProTEncoder (proT_enc) and EncoderForecaster.
+
+Covers: output shapes for both head variants, attention pooling, the
+forcing-boundary logic (real IST at inference), censored-loss backward,
+checkpoint roundtrip, and the scheduled curriculum.
+"""
+
+import math
+import pytest
+import torch
+import torch.nn.functional as F
+
+from proT.core.model_encoder import ProTEncoder
+from proT.training.forecasters.encoder_forecaster import EncoderForecaster
+from proT.training.losses import CensoredGaussianNLL
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def _tiny_config(head_type="gru", output_dim=None, d_hidden=8, rnn_n_layers=1,
+                out_dim=2, d_model_enc=16, d_model_dec=16, e_layers=2,
+                n_heads=2, d_qk=8, d_ff=32, dropout=0.0):
+    """Tiny config for fast unit tests."""
+    return {
+        "model": {
+            "model_object": "proT_enc",
+            "kwargs": {
+                "model": "proT_enc",
+                "ds_embed_enc": {
+                    "setting": {"sparse_grad": False},
+                    "modules": [
+                        {"idx": 0, "embed": "nn_embedding", "label": "variable",
+                         "kwargs": {"num_embeddings": 5, "embedding_dim": d_model_enc}},
+                        {"idx": 1, "embed": "linear", "label": "value",
+                         "kwargs": {"input_dim": 1, "embedding_dim": d_model_enc}},
+                        {"idx": 1, "embed": "mask", "label": "value_missing", "kwargs": {}},
+                        {"idx": 2, "embed": "pass", "label": "order", "kwargs": {}},
+                    ],
+                },
+                "comps_embed_enc": "summation",
+                "ds_embed_dec": {
+                    "setting": {"sparse_grad": False},
+                    "modules": [
+                        {"idx": 0, "embed": "nn_embedding", "label": "variable",
+                         "kwargs": {"num_embeddings": 3, "embedding_dim": d_model_dec}},
+                        {"idx": 1, "embed": "nn_embedding", "label": "position",
+                         "kwargs": {"num_embeddings": 20, "embedding_dim": d_model_dec}},
+                        {"idx": 2, "embed": "linear", "label": "value",
+                         "kwargs": {"input_dim": 1, "embedding_dim": d_model_dec}},
+                        {"idx": 2, "embed": "mask", "label": "value_missing", "kwargs": {}},
+                        {"idx": 2, "embed": "mask_given", "label": "value_given", "kwargs": {}},
+                        {"idx": 1, "embed": "pass", "label": "order", "kwargs": {}},
+                        {"idx": 3, "embed": "nn_embedding", "label": "online_pos_mask",
+                         "kwargs": {"num_embeddings": 3, "embedding_dim": d_model_dec}},
+                    ],
+                },
+                "comps_embed_dec": "summation",
+                "enc_attention_type": "ScaledDotProduct",
+                "enc_mask_type": "Uniform",
+                "n_heads": n_heads,
+                "enc_causal_mask": False,
+                "enc_group_mask": False,
+                "dropout_emb": dropout,
+                "dropout_data": dropout,
+                "dropout_attn_out": dropout,
+                "dropout_ff": dropout,
+                "enc_dropout_qkv": dropout,
+                "enc_attention_dropout": dropout,
+                "e_layers": e_layers,
+                "activation": "gelu",
+                "norm": "layer",
+                "use_final_norm": True,
+                "device": "cpu",
+                "out_dim": out_dim,
+                "d_ff": d_ff,
+                "d_model_enc": d_model_enc,
+                "d_model_dec": d_model_dec,
+                "d_qk": d_qk,
+                "head_type": head_type,
+                "output_dim": output_dim,
+                "d_hidden": d_hidden,
+                "rnn_n_layers": rnn_n_layers,
+                "rnn_dropout": 0.0,
+                "dec_val_idx": 2,
+                "dec_pos_idx": 1,
+            },
+        },
+        "training": {
+            "loss_fn": "gaussian_censored",
+            "loss_censor_threshold": 1.0,
+            "loss_bce_on_observed": False,
+            "lr": 1e-3,
+            "weight_decay": 0.01,
+            "lam": 1.0,
+            "gamma": 0.1,
+            "entropy_regularizer": False,
+            "max_epochs": 10,
+            "target_show_mode": "scheduled",
+            "epoch_show_trg": 2,
+            "show_trg_max_idx_start": 5,
+            "show_trg_max_idx_end": 0,
+            "show_trg_schedule": "linear",
+            "show_trg_schedule_end_frac": 1.0,
+            "show_trg_random_draw": False,
+        },
+        "data": {
+            "val_idx": 2,
+            "pos_idx": 1,
+        },
+    }
+
+
+def _tiny_batch(B=4, L_enc=6, L_dec=10, D_enc=3, D_dec=4, nan_tail=False):
+    """Tiny batch of (X, Y) with optional NaN tail in the target value."""
+    X = torch.randn(B, L_enc, D_enc)
+    X[:, :, 0] = torch.randint(1, 5, (B, L_enc)).float()  # variable ids
+    X[:, :, 2] = torch.arange(L_enc).float().unsqueeze(0).expand(B, -1)  # order
+
+    Y = torch.randn(B, L_dec, D_dec)
+    Y[:, :, 0] = torch.randint(1, 3, (B, L_dec)).float()  # variable ids
+    Y[:, :, 1] = torch.arange(1, L_dec + 1).float().unsqueeze(0).expand(B, -1)  # position
+    Y[:, :, 3] = 0.0  # given indicator (overwritten by forecaster)
+
+    if nan_tail:
+        # simulate right-censoring: last 30% of positions are NaN
+        n_nan = int(0.3 * L_dec)
+        Y[:, -n_nan:, 2] = float("nan")
+
+    return X, Y
+
+
+# ---------------------------------------------------------------------------
+# ProTEncoder model
+# ---------------------------------------------------------------------------
+
+class TestProTEncoder:
+    def test_gru_forward_shapes(self):
+        cfg = _tiny_config(head_type="gru", d_hidden=8, out_dim=2)
+        model = ProTEncoder(**cfg["model"]["kwargs"])
+        X, Y = _tiny_batch()
+        out, recon, (enc_att, dec_att, pool_att), enc_mask, (enc_ent, dec_ent, pool_ent) = \
+            model.forward(input_tensor=X, target_tensor=Y)
+        assert out.shape == (4, 10, 2)          # (B, L_dec, out_dim)
+        assert recon.shape == (4, 6, 1)         # (B, L_enc, 1)
+        assert len(enc_att) == 2                # e_layers
+        assert dec_att == []                    # no decoder self-attention
+        assert len(pool_att) == 1               # pooling attention
+        assert len(enc_ent) == 2
+        assert dec_ent == []
+        assert pool_ent == []
+
+    def test_scalar_forward_shapes(self):
+        cfg = _tiny_config(head_type="scalar", output_dim=5, out_dim=2)
+        model = ProTEncoder(**cfg["model"]["kwargs"])
+        X, _ = _tiny_batch()
+        out, recon, (enc_att, dec_att, pool_att), enc_mask, (enc_ent, dec_ent, pool_ent) = \
+            model.forward(input_tensor=X, target_tensor=None)
+        assert out.shape == (4, 5, 2)           # (B, output_dim, out_dim)
+        assert recon.shape == (4, 6, 1)
+        assert len(enc_att) == 2
+        assert dec_att == []
+        assert len(pool_att) == 1
+
+    def test_pooling_respects_missing_mask(self):
+        """Tokens with missing values should not contribute to the pooled context."""
+        cfg = _tiny_config(head_type="scalar", output_dim=3, out_dim=2)
+        model = ProTEncoder(**cfg["model"]["kwargs"])
+        X, _ = _tiny_batch()
+        # blank out the value channel of the first two encoder tokens
+        X[:, :2, 1] = float("nan")
+        out_masked, _, _, _, _ = model.forward(input_tensor=X, target_tensor=None)
+        X2, _ = _tiny_batch()
+        out_full, _, _, _, _ = model.forward(input_tensor=X2, target_tensor=None)
+        # the pooled context should differ when tokens are masked
+        assert not torch.allclose(out_masked, out_full)
+
+    def test_gru_teacher_forcing_boundary(self):
+        """With show_trg_max_idx=k, positions <= k must receive the real value."""
+        cfg = _tiny_config(head_type="gru", d_hidden=8, out_dim=2)
+        model = ProTEncoder(**cfg["model"]["kwargs"])
+        X, Y = _tiny_batch(L_dec=10)
+        k = 4
+        trg_pos_mask = (Y[:, :, 1] > k).unsqueeze(-1)  # True = predict, False = given
+        out_forced, _, _, _, _ = model.forward(
+            input_tensor=X, target_tensor=Y, trg_pos_mask=trg_pos_mask)
+        out_free, _, _, _, _ = model.forward(
+            input_tensor=X, target_tensor=Y, trg_pos_mask=None)
+        # the forced and free runs should differ after the forcing boundary
+        assert not torch.allclose(out_forced[:, k:, :], out_free[:, k:, :])
+
+    def test_backward_censored(self):
+        """CensoredGaussianNLL must backpropagate through the GRU head."""
+        cfg = _tiny_config(head_type="gru", d_hidden=8, out_dim=2)
+        model = ProTEncoder(**cfg["model"]["kwargs"])
+        X, Y = _tiny_batch(nan_tail=True)
+        out, _, _, _, _ = model.forward(input_tensor=X, target_tensor=Y)
+        loss_fn = CensoredGaussianNLL(threshold=1.0)
+        loss = loss_fn(out[:, :, 0], out[:, :, 1], Y[:, :, 2])
+        loss.backward()
+        assert torch.isfinite(loss)
+        assert any(p.grad is not None for p in model.parameters())
+
+    def test_backward_scalar(self):
+        """Scalar head must backpropagate."""
+        cfg = _tiny_config(head_type="scalar", output_dim=4, out_dim=2)
+        model = ProTEncoder(**cfg["model"]["kwargs"])
+        X, _ = _tiny_batch()
+        out, _, _, _, _ = model.forward(input_tensor=X, target_tensor=None)
+        loss = out.pow(2).mean()
+        loss.backward()
+        assert any(p.grad is not None for p in model.parameters())
+
+
+# ---------------------------------------------------------------------------
+# EncoderForecaster
+# ---------------------------------------------------------------------------
+
+class TestEncoderForecaster:
+    def test_forecaster_step_gru(self):
+        cfg = _tiny_config(head_type="gru", d_hidden=8, out_dim=2)
+        forecaster = EncoderForecaster(cfg)
+        X, Y = _tiny_batch(nan_tail=True)
+        loss, predicted, _ = forecaster._step((X, Y), stage="train")
+        assert torch.isfinite(loss)
+        assert predicted.shape == (4, 10)
+
+    def test_forecaster_step_scalar(self):
+        cfg = _tiny_config(head_type="scalar", output_dim=5, out_dim=2)
+        forecaster = EncoderForecaster(cfg)
+        X, Y = _tiny_batch()
+        # scalar head: the target is a D-dimensional vector of scalars
+        Y_scalar = Y[:, :5, :].clone()
+        loss, predicted, _ = forecaster._step((X, Y_scalar), stage="train")
+        assert torch.isfinite(loss)
+        assert predicted.shape == (4, 5)
+
+    def test_scheduled_bound(self):
+        cfg = _tiny_config(head_type="gru")
+        forecaster = EncoderForecaster(cfg)
+        # before curriculum start
+        assert forecaster._scheduled_bound(0) == 5
+        assert forecaster._scheduled_bound(2) == 5
+        # at the end
+        assert forecaster._scheduled_bound(9) == 0
+        # monotonic decrease
+        bounds = [forecaster._scheduled_bound(e) for e in range(2, 10)]
+        assert all(b1 >= b2 for b1, b2 in zip(bounds, bounds[1:]))
+
+    def test_real_ist_inference(self):
+        """At inference, show_trg_max_idx=k feeds the real value for positions <= k."""
+        cfg = _tiny_config(head_type="gru", d_hidden=8, out_dim=2)
+        forecaster = EncoderForecaster(cfg)
+        forecaster.show_trg_active = True
+        forecaster.show_trg_max_idx = 4
+        X, Y = _tiny_batch(L_dec=10)
+        out_forced, _, _, _, _ = forecaster.forward(
+            data_input=X, data_trg=Y, predict_mode=True)
+        forecaster.show_trg_max_idx = 0
+        out_free, _, _, _, _ = forecaster.forward(
+            data_input=X, data_trg=Y, predict_mode=True)
+        assert not torch.allclose(out_forced[:, 4:, :], out_free[:, 4:, :])
+
+    def test_checkpoint_roundtrip(self):
+        """The forecaster must save and load from a checkpoint."""
+        import tempfile
+        import os
+        import pytorch_lightning as pl
+        from torch.utils.data import DataLoader, TensorDataset
+        cfg = _tiny_config(head_type="gru", d_hidden=8, out_dim=2)
+        forecaster = EncoderForecaster(cfg)
+        X, Y = _tiny_batch()
+        ds = TensorDataset(X, Y)
+        dl = DataLoader(ds, batch_size=4, shuffle=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt = os.path.join(tmpdir, "model.ckpt")
+            trainer = pl.Trainer(max_epochs=1, enable_progress_bar=False, logger=False)
+            trainer.fit(forecaster, train_dataloaders=dl)
+            trainer.save_checkpoint(ckpt)
+            loaded = EncoderForecaster.load_from_checkpoint(ckpt)
+        assert loaded.model.head_type == "gru"
+        out1, _, _, _, _ = forecaster.forward(data_input=X, data_trg=Y)
+        out2, _, _, _, _ = loaded.forward(data_input=X, data_trg=Y)
+        assert torch.allclose(out1, out2)  # type: ignore
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(pytest.main([__file__, "-v"]))

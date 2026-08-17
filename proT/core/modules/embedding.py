@@ -1,3 +1,5 @@
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -76,6 +78,7 @@ class ModularEmbedding(nn.Module):
         self.mask_idx = None
         self.mask_given_idx = None
         self.val_idx = None
+        self.group_idx = None
         
         # unpack settings for spatiotemporal
         d_model = ds_embed["setting"]["d_model"] if comps == "spatiotemporal" else None
@@ -90,11 +93,20 @@ class ModularEmbedding(nn.Module):
             idx_, embed_, label_ ,kwargs = var["idx"], var["embed"], var["label"], var["kwargs"]
             
             # assign embedding layers
-            assert embed_ in ["mask", "mask_given", "nn_embedding", "sinusoidal","time2vec","identity","linear","pass","value"], AssertionError("Invalid embedding selected!")
+            assert embed_ in ["mask", "mask_given", "nn_embedding", "sinusoidal","time2vec","identity","linear","pass","value","group"], AssertionError("Invalid embedding selected!")
             
             if embed_ == "mask":
                 self.mask_idx = idx_
                 emb_module = None
+            
+            # store group index (used to build group attention masks)
+            if embed_ == "group":
+                emb_module = None             # do not append in the Embedding List
+                
+                if self.group_idx is None:
+                    self.group_idx = idx_
+                else:
+                    warnings.warn("Multiple 'group' embeddings defined. Only the first one is used.")
                 
             if embed_ == "mask_given":
                 self.mask_given_idx = idx_
@@ -268,6 +280,20 @@ class ModularEmbedding(nn.Module):
     
     def pass_var(self, X: torch.Tensor)->torch.Tensor:
         return X[:,:,self.pass_idx_list] if self.pass_idx_list is not None else None
+    
+    
+    def get_group_var(self, X: torch.Tensor)->torch.Tensor:
+        """
+        Raw group ids used to build group attention masks.
+
+        Args:
+            X (torch.Tensor): input tensor BxLxD
+
+        Returns:
+            torch.Tensor: group ids of shape BxL, or None if no "group"
+                          embedding is configured
+        """
+        return X[:,:,self.group_idx] if self.group_idx is not None else None
 
 
 

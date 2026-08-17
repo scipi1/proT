@@ -29,7 +29,8 @@ def cli():
 @click.option("--scratch_path", default=None, help="SCRATCH path") # for the cluster
 @click.option("--resume_checkpoint", default=None, help="Resume training from checkpoint")
 @click.option("--plot_pred_check", default=True, help="Set to True for a quick prediction plot after training")
-def train(exp_id, debug, cluster, exp_tag, scratch_path, resume_checkpoint, plot_pred_check):
+@click.option("--best/--no-best", default=True, help="Evaluate val/test on the best (val_mae) checkpoint instead of the final epoch")
+def train(exp_id, debug, cluster, exp_tag, scratch_path, resume_checkpoint, plot_pred_check, best):
     
     # Get folders
     ROOT_DIR = dirname(dirname(abspath(__file__)))
@@ -73,7 +74,8 @@ def train(exp_id, debug, cluster, exp_tag, scratch_path, resume_checkpoint, plot
         experiment_tag=exp_tag,
         resume_ckpt=resume_checkpoint,
         plot_pred_check=plot_pred_check,
-        debug=debug)
+        debug=debug,
+        best=best)
 
 
 cli.add_command(train)
