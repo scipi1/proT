@@ -22,7 +22,8 @@ from proT.training.losses import CensoredGaussianNLL
 
 def _tiny_config(head_type="gru", output_dim=None, d_hidden=8, rnn_n_layers=1,
                 out_dim=2, d_model_enc=16, d_model_dec=16, e_layers=2,
-                n_heads=2, d_qk=8, d_ff=32, dropout=0.0):
+                n_heads=2, d_qk=8, d_ff=32, dropout=0.0,
+                n_dec_vars=None, dec_var_idx=None):
     """Tiny config for fast unit tests."""
     return {
         "model": {
@@ -86,6 +87,8 @@ def _tiny_config(head_type="gru", output_dim=None, d_hidden=8, rnn_n_layers=1,
                 "rnn_dropout": 0.0,
                 "dec_val_idx": 2,
                 "dec_pos_idx": 1,
+                "n_dec_vars": n_dec_vars,
+                "dec_var_idx": dec_var_idx,
             },
         },
         "training": {
@@ -128,6 +131,31 @@ def _tiny_batch(B=4, L_enc=6, L_dec=10, D_enc=3, D_dec=4, nan_tail=False):
         # simulate right-censoring: last 30% of positions are NaN
         n_nan = int(0.3 * L_dec)
         Y[:, -n_nan:, 2] = float("nan")
+
+    return X, Y
+
+
+def _tiny_batch_pervar(B=4, L_enc=6, L_per_var=5, D_enc=3, D_dec=4, n_vars=2,
+                       nan_tail=False):
+    """Tiny batch with a variable-major target layout: [var 1 block, var 2 block].
+
+    Positions restart from 1 within each variable block.
+    """
+    X = torch.randn(B, L_enc, D_enc)
+    X[:, :, 0] = torch.randint(1, 5, (B, L_enc)).float()  # variable ids
+    X[:, :, 2] = torch.arange(L_enc).float().unsqueeze(0).expand(B, -1)  # order
+
+    L_dec = L_per_var * n_vars
+    Y = torch.randn(B, L_dec, D_dec)
+    var_ids = torch.cat([torch.full((L_per_var,), float(v)) for v in range(1, n_vars + 1)])
+    Y[:, :, 0] = var_ids.unsqueeze(0).expand(B, -1)  # variable ids (same layout for all)
+    pos = torch.arange(1, L_per_var + 1).float().repeat(n_vars)
+    Y[:, :, 1] = pos.unsqueeze(0).expand(B, -1)  # position restarts per variable
+    Y[:, :, 3] = 0.0  # given indicator (overwritten by forecaster)
+
+    if nan_tail:
+        # simulate right-censoring: last position of each variable block is NaN
+        Y[:, [L_per_var - 1, L_dec - 1], 2] = float("nan")
 
     return X, Y
 
@@ -214,6 +242,130 @@ class TestProTEncoder:
         assert any(p.grad is not None for p in model.parameters())
 
 
+class TestProTEncoderPerVar:
+    """Tests for the per-variable GRU head (head_type="gru_per_var")."""
+
+    def _pervar_config(self, **kw):
+        return _tiny_config(head_type="gru_per_var", d_hidden=8, out_dim=2,
+                            n_dec_vars=2, dec_var_idx=0, **kw)
+
+    def test_gru_per_var_forward_shapes(self):
+        cfg = self._pervar_config()
+        model = ProTEncoder(**cfg["model"]["kwargs"])
+        X, Y = _tiny_batch_pervar(L_per_var=5)
+        out, recon, (enc_att, dec_att, pool_att), enc_mask, (enc_ent, dec_ent, pool_ent) = \
+            model.forward(input_tensor=X, target_tensor=Y)
+        assert out.shape == (4, 10, 2)          # (B, L_dec, out_dim)
+        assert recon.shape == (4, 6, 1)
+        assert dec_att == []
+        assert len(pool_att) == 1
+
+    def test_gru_per_var_stream_independence(self):
+        """Variable 2 predictions must not depend on variable 1's given values."""
+        cfg = self._pervar_config()
+        model = ProTEncoder(**cfg["model"]["kwargs"])
+        model.eval()
+        X, Y = _tiny_batch_pervar(L_per_var=5)
+        L_per_var = 5
+        k = 3  # force the first k positions of each variable
+        trg_pos_mask = (Y[:, :, 1] > k).unsqueeze(-1)  # True = predict, False = given
+
+        with torch.no_grad():
+            out1, _, _, _, _ = model.forward(
+                input_tensor=X, target_tensor=Y, trg_pos_mask=trg_pos_mask)
+            # perturb variable 1's given values
+            Y2 = Y.clone()
+            Y2[:, :L_per_var, 2] += 1.0
+            out2, _, _, _, _ = model.forward(
+                input_tensor=X, target_tensor=Y2, trg_pos_mask=trg_pos_mask)
+
+        # variable 1 predictions change (different given values) ...
+        assert not torch.allclose(out1[:, :L_per_var, :], out2[:, :L_per_var, :])
+        # ... but variable 2 predictions are identical (independent stream)
+        assert torch.allclose(out1[:, L_per_var:, :], out2[:, L_per_var:, :])
+
+    def test_gru_per_var_distinct_initial_states(self):
+        """Each variable's rollout must start from its own h0 (per-variable GRUs)."""
+        cfg = self._pervar_config()
+        model = ProTEncoder(**cfg["model"]["kwargs"])
+        assert isinstance(model.rnn, torch.nn.ModuleList) and len(model.rnn) == 2
+        assert isinstance(model.rnn_head, torch.nn.ModuleList) and len(model.rnn_head) == 2
+        # the h0 projection produces n_dec_vars * n_layers * d_hidden values
+        assert model.h0_projection.out_features == 2 * 1 * 8
+
+    def test_gru_per_var_teacher_forcing_boundary(self):
+        """Forced and free runs must differ after the forcing boundary (both variables)."""
+        cfg = self._pervar_config()
+        model = ProTEncoder(**cfg["model"]["kwargs"])
+        X, Y = _tiny_batch_pervar(L_per_var=5)
+        k = 2
+        trg_pos_mask = (Y[:, :, 1] > k).unsqueeze(-1)
+        out_forced, _, _, _, _ = model.forward(
+            input_tensor=X, target_tensor=Y, trg_pos_mask=trg_pos_mask)
+        out_free, _, _, _, _ = model.forward(
+            input_tensor=X, target_tensor=Y, trg_pos_mask=None)
+        assert not torch.allclose(out_forced[:, k:, :], out_free[:, k:, :])
+
+    def test_gru_per_var_ragged_layout(self):
+        """Truncated/shifted variable blocks and NaN tail padding must work."""
+        cfg = self._pervar_config()
+        model = ProTEncoder(**cfg["model"]["kwargs"])
+        model.eval()
+        X, Y = _tiny_batch_pervar(L_per_var=5)
+        # sample 1: variable 1 truncated by one token (packed) -> variable 2
+        # block shifted by one position, NaN padding at the tail
+        Y[1, :, 0] = torch.cat([
+            torch.full((4,), 1.0), torch.full((5,), 2.0),
+            torch.tensor([float("nan")])])
+        # sample 2: NaN padding at the tail of the variable 2 block
+        Y[2, -2:, 0] = float("nan")
+        with torch.no_grad():
+            out, _, _, _, _ = model.forward(input_tensor=X, target_tensor=Y)
+        assert out.shape == (4, 10, 2)
+        assert torch.isfinite(out).all()
+        # padded positions (NaN variable id) keep zero output
+        assert (out[1, -1, :] == 0).all()
+        assert (out[2, -2:, :] == 0).all()
+
+    def test_gru_per_var_scatter_back_consistency(self):
+        """A shifted variable block must yield the same predictions as the
+        aligned block when the per-variable inputs are identical."""
+        cfg = self._pervar_config()
+        model = ProTEncoder(**cfg["model"]["kwargs"])
+        model.eval()
+        X, Y = _tiny_batch_pervar(B=2, L_per_var=5)
+        # identical encoder input -> identical h0 for both samples
+        X[1] = X[0]
+        # sample 1: drop the last var-1 token, shift the var-2 block one position
+        # to the left, NaN padding at the tail; var-2 covariates identical to
+        # sample 0's var-2 block
+        Y[1, :, 0] = torch.cat([
+            torch.full((4,), 1.0), torch.full((5,), 2.0),
+            torch.tensor([float("nan")])])
+        Y[1, 4:9, 1:] = Y[0, 5:10, 1:]
+        with torch.no_grad():
+            out, _, _, _, _ = model.forward(input_tensor=X, target_tensor=Y)
+        # var-2 predictions of the shifted sample match the aligned sample
+        assert torch.allclose(out[1, 4:9, :], out[0, 5:10, :], atol=1e-5)
+        # padded position keeps zero output
+        assert (out[1, -1, :] == 0).all()
+
+    def test_backward_censored_per_var(self):
+        """CensoredGaussianNLL must backpropagate through both per-variable GRUs."""
+        cfg = self._pervar_config()
+        model = ProTEncoder(**cfg["model"]["kwargs"])
+        X, Y = _tiny_batch_pervar(nan_tail=True)
+        out, _, _, _, _ = model.forward(input_tensor=X, target_tensor=Y)
+        loss_fn = CensoredGaussianNLL(threshold=1.0)
+        loss = loss_fn(out[:, :, 0], out[:, :, 1], Y[:, :, 2])
+        loss.backward()
+        assert torch.isfinite(loss)
+        # both per-variable GRUs and heads receive gradients
+        for rnn, head in zip(model.rnn, model.rnn_head):
+            assert rnn.weight_ih_l0.grad is not None
+            assert head.weight.grad is not None
+
+
 # ---------------------------------------------------------------------------
 # EncoderForecaster
 # ---------------------------------------------------------------------------
@@ -281,6 +433,38 @@ class TestEncoderForecaster:
             trainer.save_checkpoint(ckpt)
             loaded = EncoderForecaster.load_from_checkpoint(ckpt)
         assert loaded.model.head_type == "gru"
+        out1, _, _, _, _ = forecaster.forward(data_input=X, data_trg=Y)
+        out2, _, _, _, _ = loaded.forward(data_input=X, data_trg=Y)
+        assert torch.allclose(out1, out2)  # type: ignore
+
+    def test_forecaster_step_gru_per_var(self):
+        cfg = _tiny_config(head_type="gru_per_var", d_hidden=8, out_dim=2,
+                           n_dec_vars=2, dec_var_idx=0)
+        forecaster = EncoderForecaster(cfg)
+        X, Y = _tiny_batch_pervar(nan_tail=True)
+        loss, predicted, _ = forecaster._step((X, Y), stage="train")
+        assert torch.isfinite(loss)
+        assert predicted.shape == (4, 10)
+
+    def test_checkpoint_roundtrip_per_var(self):
+        """The per-variable GRU forecaster must save and load from a checkpoint."""
+        import tempfile
+        import os
+        import pytorch_lightning as pl
+        from torch.utils.data import DataLoader, TensorDataset
+        cfg = _tiny_config(head_type="gru_per_var", d_hidden=8, out_dim=2,
+                           n_dec_vars=2, dec_var_idx=0)
+        forecaster = EncoderForecaster(cfg)
+        X, Y = _tiny_batch_pervar()
+        ds = TensorDataset(X, Y)
+        dl = DataLoader(ds, batch_size=4, shuffle=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt = os.path.join(tmpdir, "model.ckpt")
+            trainer = pl.Trainer(max_epochs=1, enable_progress_bar=False, logger=False)
+            trainer.fit(forecaster, train_dataloaders=dl)
+            trainer.save_checkpoint(ckpt)
+            loaded = EncoderForecaster.load_from_checkpoint(ckpt)
+        assert loaded.model.head_type == "gru_per_var"
         out1, _, _, _, _ = forecaster.forward(data_input=X, data_trg=Y)
         out2, _, _, _, _ = loaded.forward(data_input=X, data_trg=Y)
         assert torch.allclose(out1, out2)  # type: ignore

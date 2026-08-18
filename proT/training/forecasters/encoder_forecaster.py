@@ -9,6 +9,10 @@ Supports two head variants:
   is inferred from the encoder output via attention pooling. Supports the
   "real IST" inference mode (teacher forcing on the first k positions) and
   the scheduled curriculum used by OnlineTargetForecaster.
+- "gru_per_var": like "gru", but with one independent GRU (and output head)
+  per target variable; each variable's rollout starts from its own
+  encoder-derived initial hidden state and no hidden state flows across
+  variables. Requires model.kwargs n_dec_vars and dec_var_idx.
 
 The probabilistic losses (PositionWeightedMSE / CensoredGaussianNLL) are kept
 unchanged: the model outputs (mu, raw_sigma) channels.
@@ -353,8 +357,8 @@ class EncoderForecaster(pl.LightningModule):
         Uses automatic PyTorch Lightning optimization.
         """
         # The scalar head has no sequential target to reveal: the adaptive
-        # curriculum is only active for the GRU head.
-        if self.model.head_type == "gru":
+        # curriculum is only active for the GRU heads.
+        if self.model.head_type in ("gru", "gru_per_var"):
             # Check if we should start showing targets
             if self.current_epoch == self.epoch_show_trg:
                 self.show_trg_active = True

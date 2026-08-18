@@ -38,6 +38,15 @@ class ProTEncoder(nn.Module):
       channels (mu, raw_sigma), so the probabilistic losses
       (PositionWeightedMSE / CensoredGaussianNLL) apply unchanged.
 
+    - head_type="gru_per_var": like "gru", but with one independent GRU (and
+      one independent linear head) per target variable. The pooled context is
+      projected to n_dec_vars initial hidden states, so each variable's
+      rollout starts from its own encoder-derived h0 and no hidden state
+      flows across variables. The target sequence is split by the variable
+      channel (dec_var_idx, ids 1..n_dec_vars) and the per-variable
+      predictions are scattered back to the original positions, so the
+      output shape (B, L_dec, out_dim) is unchanged.
+
     The forward signature mirrors ProT.forward: decoder attention/entropy
     entries are returned as empty lists so that callbacks and plotting code
     keep working unchanged.
@@ -81,21 +90,28 @@ class ProTEncoder(nn.Module):
 
         # encoder-only specific
         enc_group_mask: bool = False,
-        head_type: str = "gru",            # "scalar" | "gru"
+        head_type: str = "gru",            # "scalar" | "gru" | "gru_per_var"
         output_dim: Optional[int] = None,  # scalar head: number of scalar targets
         d_hidden: int = 128,               # GRU hidden dimension
         rnn_n_layers: int = 1,
         rnn_dropout: float = 0.0,
         dec_val_idx: int = 3,              # value channel in the target tensor
         dec_pos_idx: int = 1,              # position channel in the target tensor
+        n_dec_vars: Optional[int] = None,  # gru_per_var: number of target variables
+        dec_var_idx: Optional[int] = None, # gru_per_var: variable channel in the target tensor
         ):
         super().__init__()
 
-        assert head_type in ["scalar", "gru"], \
-            f"head_type must be 'scalar' or 'gru', got {head_type}"
+        assert head_type in ["scalar", "gru", "gru_per_var"], \
+            f"head_type must be 'scalar', 'gru' or 'gru_per_var', got {head_type}"
         if head_type == "scalar":
             assert output_dim is not None and output_dim > 0, \
                 "output_dim must be a positive integer for the scalar head"
+        if head_type == "gru_per_var":
+            assert n_dec_vars is not None and n_dec_vars > 0, \
+                "n_dec_vars must be a positive integer for the gru_per_var head"
+            assert dec_var_idx is not None, \
+                "dec_var_idx must be set for the gru_per_var head"
 
         self.head_type = head_type
         self.output_dim = output_dim
@@ -104,6 +120,8 @@ class ProTEncoder(nn.Module):
         self.out_dim = out_dim
         self.dec_val_idx = dec_val_idx
         self.dec_pos_idx = dec_pos_idx
+        self.n_dec_vars = n_dec_vars
+        self.dec_var_idx = dec_var_idx
 
         # encoder input embedding
         self.enc_embedding = ModularEmbedding(
@@ -165,21 +183,37 @@ class ProTEncoder(nn.Module):
             assert output_dim is not None, "output_dim must be set for the scalar head"
             self.scalar_head = nn.Linear(d_model_enc, output_dim * out_dim, bias=True)
         else:
-            # context -> initial hidden state of the GRU
-            self.h0_projection = nn.Linear(d_model_enc, rnn_n_layers * d_hidden, bias=True)
             # target covariate embedding for the GRU inputs
             self.dec_embedding = ModularEmbedding(
                 ds_embed=ds_embed_dec,
                 comps=comps_embed_dec,
                 device=device)
-            self.rnn = nn.GRU(
-                input_size=d_model_dec + 1,
-                hidden_size=d_hidden,
-                num_layers=rnn_n_layers,
-                batch_first=True,
-                dropout=rnn_dropout if rnn_n_layers > 1 else 0.0
-                )
-            self.rnn_head = nn.Linear(d_hidden, out_dim, bias=True)
+            if head_type == "gru":
+                # context -> initial hidden state of the GRU
+                self.h0_projection = nn.Linear(d_model_enc, rnn_n_layers * d_hidden, bias=True)
+                self.rnn = nn.GRU(
+                    input_size=d_model_dec + 1,
+                    hidden_size=d_hidden,
+                    num_layers=rnn_n_layers,
+                    batch_first=True,
+                    dropout=rnn_dropout if rnn_n_layers > 1 else 0.0
+                    )
+                self.rnn_head = nn.Linear(d_hidden, out_dim, bias=True)
+            else:
+                # gru_per_var: context -> one initial hidden state per variable;
+                # one independent GRU and one independent head per variable
+                self.h0_projection = nn.Linear(
+                    d_model_enc, n_dec_vars * rnn_n_layers * d_hidden, bias=True)
+                self.rnn = nn.ModuleList([
+                    nn.GRU(
+                        input_size=d_model_dec + 1,
+                        hidden_size=d_hidden,
+                        num_layers=rnn_n_layers,
+                        batch_first=True,
+                        dropout=rnn_dropout if rnn_n_layers > 1 else 0.0
+                        ) for _ in range(n_dec_vars)])
+                self.rnn_head = nn.ModuleList([
+                    nn.Linear(d_hidden, out_dim, bias=True) for _ in range(n_dec_vars)])
 
         # reconstruction head (kept for parity with ProT)
         self.reconstructor = nn.Linear(d_model_enc, 1, bias=True)
@@ -304,8 +338,10 @@ class ProTEncoder(nn.Module):
         if self.head_type == "scalar":
             forecast_out = self.scalar_head(context).view(
                 context.size(0), self.output_dim, self.out_dim)
-        else:
+        elif self.head_type == "gru":
             forecast_out = self._gru_rollout(context, target_tensor, trg_pos_mask)
+        else:
+            forecast_out = self._gru_rollout_per_var(context, target_tensor, trg_pos_mask)
 
         recon_out = self.reconstructor(enc_out)
 
@@ -354,3 +390,75 @@ class ProTEncoder(nn.Module):
             prev_val = pred[:, 0]                                # predicted mean fed back
 
         return torch.stack(outputs, dim=1)                       # (B, L_dec, out_dim)
+
+    def _gru_rollout_per_var(self, context, target_tensor, trg_pos_mask):
+        """
+        Like _gru_rollout, but with one independent GRU per target variable.
+        The pooled context is projected to n_dec_vars initial hidden states;
+        each variable's subsequence (selected via the variable channel) is
+        unrolled by its own GRU from its own h0, so no hidden state flows
+        across variables. Predictions are scattered back to the original
+        positions, preserving the (B, L_dec, out_dim) output layout.
+
+        Ragged layouts are supported: variable blocks may have different
+        lengths across samples (packed sequences), and padded tokens
+        (variable id 0 or NaN) are excluded from the rollouts.
+        """
+        B, L_dec, _ = target_tensor.shape
+
+        # per-variable initial hidden states from the attention-pooled context
+        h0 = torch.tanh(self.h0_projection(context))          # (B, n_vars * n_layers * d_hidden)
+        h0 = h0.view(B, self.n_dec_vars, self.rnn_n_layers, self.d_hidden)
+
+        # embed the target covariates (value channel zeroed; it is fed separately)
+        dec_cov = target_tensor.clone()
+        dec_cov[:, :, self.dec_val_idx] = 0.0
+        dec_emb = self.dec_embedding(X=dec_cov)               # (B, L_dec, d_model_dec)
+
+        # value channel to feed at each step: real where given, predicted elsewhere
+        if trg_pos_mask is not None:
+            given = torch.logical_not(trg_pos_mask).squeeze(-1)  # (B, L_dec) bool
+        else:
+            given = torch.zeros(B, L_dec, dtype=torch.bool, device=target_tensor.device)
+
+        real_val = torch.nan_to_num(target_tensor[:, :, self.dec_val_idx])
+        # NaN variable ids (padded tail) become 0 = padding: excluded from all streams
+        var_ids = torch.nan_to_num(target_tensor[:, :, self.dec_var_idx], nan=0.0).long()
+
+        outputs = target_tensor.new_zeros(B, L_dec, self.out_dim)
+
+        for v in range(1, self.n_dec_vars + 1):
+            mask_v = var_ids == v                                # (B, L_dec)
+            L_v = int(mask_v.sum(dim=1).max())
+            if L_v == 0:
+                continue
+
+            # gather each sample's variable-v positions (original order) to the
+            # front of the gathered sequence; padded entries (beyond a sample's
+            # valid length) sit at the end and their predictions are discarded
+            idx_v = torch.argsort(
+                torch.logical_not(mask_v).long(), dim=1, stable=True)[:, :L_v]  # (B, L_v)
+            valid_v = mask_v.gather(1, idx_v)                    # (B, L_v)
+
+            h = h0[:, v - 1].permute(1, 0, 2).contiguous()       # (n_layers, B, d_hidden)
+            emb_v = dec_emb.gather(1, idx_v.unsqueeze(-1).expand(-1, -1, dec_emb.size(-1)))
+            given_v = given.gather(1, idx_v)                     # (B, L_v)
+            real_v = real_val.gather(1, idx_v)                   # (B, L_v)
+
+            preds_v = []
+            prev_val = torch.zeros_like(real_v[:, 0])            # no leak of the first real value
+            for t in range(L_v):
+                step_val = torch.where(given_v[:, t], real_v[:, t], prev_val)
+                step_in = torch.cat(
+                    [emb_v[:, t, :], step_val.unsqueeze(-1)], dim=-1).unsqueeze(1)  # (B, 1, d_model_dec+1)
+                out, h = self.rnn[v - 1](step_in, h)             # (B, 1, d_hidden)
+                pred = self.rnn_head[v - 1](out.squeeze(1))      # (B, out_dim)
+                preds_v.append(pred)
+                prev_val = pred[:, 0]                            # predicted mean fed back
+            preds_v = torch.stack(preds_v, dim=1)                # (B, L_v, out_dim)
+
+            # scatter back to the original positions (valid entries only; both
+            # boolean masks select in the same batch-major, position order)
+            outputs[mask_v] = preds_v[valid_v]
+
+        return outputs                                           # (B, L_dec, out_dim)

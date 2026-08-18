@@ -128,7 +128,8 @@ model = OnlineTargetForecaster(config)
 **Description:** Encoder-only proT variant (`proT_enc`). The transformer encoder processes the input sequence; a learnable query token pools the encoder outputs via attention into a context vector. Two head variants are supported:
 
 - **Scalar head** (`head_type: "scalar"`): predicts a D-dimensional vector of scalar targets per sample (e.g. IST slope, fitting coefficients). The dataset provides the scalar targets directly; the model output is `(B, D, out_dim)`.
-- **GRU head** (`head_type: "gru"`): the context vector initializes the hidden state of a GRU, which is unrolled over the target positions. Per-step inputs are the target covariates (position, variable, value, given-indicator) embedded with the existing `ModularEmbedding`. The value channel is fed with the real target where given (teacher forcing / "real IST" at inference) and with the predicted mean elsewhere (autoregressive rollout).
+- **GRU head** (`head_type: "gru"`): the context vector initializes the hidden state of a GRU, which is unrolled over the target positions. Per-step inputs are the target covariates (position, variable, value, given-indicator) embedded with the existing `ModularEmbedding`. The value channel is fed with the real target where given (teacher forcing / "real IST" at inference) and with the predicted mean elsewhere (autoregressive rollout). Note: with multiple target variables this is a *single* stream over the whole target sequence, so the hidden state flows across variables.
+- **Per-variable GRU head** (`head_type: "gru_per_var"`): like `"gru"`, but the context vector is projected to `n_dec_vars` initial hidden states and each target variable is unrolled by its own independent GRU (and its own output head), starting from its own encoder-derived h0. No hidden state flows across variables. The target sequence is split by the variable channel (`dec_var_idx`, ids `1..n_dec_vars`) and predictions are scattered back to the original positions, so the output stays `(B, L_dec, out_dim)` and all losses/curriculum work unchanged. Ragged layouts are supported: variable blocks may have different lengths across samples (packed sequences), and padded tokens (variable id 0 or NaN) are excluded from the rollouts.
 
 **Features:**
 - ✅ Probabilistic losses (`PositionWeightedMSE` / `CensoredGaussianNLL`) unchanged
@@ -142,13 +143,15 @@ model = OnlineTargetForecaster(config)
 model:
   model_object: "proT_enc"
   kwargs:
-    head_type: "gru"        # "scalar" | "gru"
+    head_type: "gru"        # "scalar" | "gru" | "gru_per_var"
     output_dim: null        # scalar head: number of scalar targets (D)
     d_hidden: 128           # GRU hidden dimension
     rnn_n_layers: 1
     rnn_dropout: 0.0
     dec_val_idx: 3          # value channel in the target tensor
     dec_pos_idx: 1          # position channel in the target tensor
+    n_dec_vars: 2           # gru_per_var only: number of target variables
+    dec_var_idx: 2          # gru_per_var only: variable channel in the target tensor
 ```
 
 **Usage:**
