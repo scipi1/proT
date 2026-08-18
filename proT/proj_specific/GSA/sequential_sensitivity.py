@@ -151,10 +151,17 @@ def _kl_per_sample(
 
 
 def _is_probabilistic_config(config: dict) -> bool:
-    """True if the model was trained with a Gaussian (mu, raw_sigma) head."""
+    """True if the model was trained with a probabilistic (mu, raw_sigma) head.
+
+    For the lognormal losses, mu and sigma parameterize log(y + shift); the
+    w2/kl metrics then measure distances in log-space (the Gaussian formulas
+    apply to the underlying normal in the transformed space).
+    """
     loss_fn = config.get("training", {}).get("loss_fn", "mse")
     out_dim = config.get("model", {}).get("kwargs", {}).get("out_dim", 1)
-    return loss_fn in ("gaussian", "gaussian_censored") and out_dim == 2
+    return loss_fn in (
+        "gaussian", "gaussian_censored", "lognormal", "lognormal_censored"
+    ) and out_dim == 2
 
 
 def _resolve_error_metric(error_metric: str, probabilistic: bool) -> str:

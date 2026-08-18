@@ -27,7 +27,14 @@ import pytorch_lightning as pl
 import torchmetrics as tm
 
 from proT.core.model_encoder import ProTEncoder
-from proT.training.losses import PositionWeightedMSE, CensoredGaussianNLL, GaussianNLL
+from proT.training.losses import (
+    PositionWeightedMSE,
+    CensoredGaussianNLL,
+    GaussianNLL,
+    LogNormalNLL,
+    CensoredLogNormalNLL,
+)
+from proT.training.sample_weights import AdaptiveLossWeighter, summarize_target
 from proT.training.qk_schedule import configure_adamw_with_qk_ramp
 
 
@@ -38,9 +45,12 @@ class EncoderForecaster(pl.LightningModule):
     Args:
         config: Configuration dictionary containing:
             - model.kwargs: ProTEncoder model parameters
-            - training.loss_fn: "mse" or "gaussian_censored"
-            - training.loss_censor_threshold: threshold for "gaussian_censored"
+            - training.loss_fn: "mse", "gaussian", "gaussian_censored",
+              "lognormal" or "lognormal_censored"
+            - training.loss_censor_threshold: threshold for the censored losses
             - training.loss_bce_on_observed: optional, default False
+            - training.loss_log_shift: shift s for the lognormal losses
+              (log(y + s) is modeled; must satisfy min(target) + s > 0)
             - training.lr: learning rate for AdamW
             - training.weight_decay: optional, default 0.01
             - training.lam: BCE loss weight (optional, default 1.0)
@@ -96,11 +106,57 @@ class EncoderForecaster(pl.LightningModule):
                 alpha=config["training"].get("loss_pos_weight_alpha", 2.0),
                 var_reg=config["training"].get("loss_var_reg", 0.0),
             )
+        elif config["training"]["loss_fn"] == "lognormal":
+            assert config["model"]["kwargs"].get("out_dim") == 2, \
+                "lognormal loss requires out_dim=2 (channels: mu, raw_sigma)"
+            self.loss_fn = LogNormalNLL(
+                scheme=config["training"].get("loss_pos_weight", "none"),
+                alpha=config["training"].get("loss_pos_weight_alpha", 2.0),
+                var_reg=config["training"].get("loss_var_reg", 0.0),
+                shift=config["training"].get("loss_log_shift", 1e-3),
+            )
+        elif config["training"]["loss_fn"] == "lognormal_censored":
+            assert config["model"]["kwargs"].get("out_dim") == 2, \
+                "lognormal_censored loss requires out_dim=2 (channels: mu, raw_sigma)"
+            self.loss_fn = CensoredLogNormalNLL(
+                threshold=config["training"].get("loss_censor_threshold", 1.0),
+                scheme=config["training"].get("loss_pos_weight", "none"),
+                alpha=config["training"].get("loss_pos_weight_alpha", 2.0),
+                bce_on_observed=config["training"].get("loss_bce_on_observed", False),
+                shift=config["training"].get("loss_log_shift", 1e-3),
+            )
         else:
             raise ValueError(f"Unsupported loss function: {config['training']['loss_fn']}")
 
         # Flag for the censored-likelihood mode (derived mask, no BCE head)
-        self.censored_loss = config["training"]["loss_fn"] == "gaussian_censored"
+        self.censored_loss = config["training"]["loss_fn"] in (
+            "gaussian_censored", "lognormal_censored"
+        )
+        # Flag for log-space losses: mu parameterizes log(y + shift), so the
+        # point prediction in y-space is the median exp(mu) - shift
+        self.log_space_loss = config["training"]["loss_fn"] in (
+            "lognormal", "lognormal_censored"
+        )
+        self.log_shift = config["training"].get("loss_log_shift", 1e-3)
+
+        # Adaptive sample weighting (training only; val/test stay unweighted
+        # so metrics remain comparable across loss variants)
+        self.sample_weight_scheme = config["training"].get("loss_sample_weight", "none")
+        assert self.sample_weight_scheme in ("none", "adaptive"), \
+            f"Unknown loss_sample_weight: {self.sample_weight_scheme}"
+        self.adaptive_weighter = None
+        if self.sample_weight_scheme == "adaptive":
+            self.adaptive_weighter = AdaptiveLossWeighter(
+                gamma=config["training"].get("loss_sw_gamma", 1.0),
+                form=config["training"].get("loss_sw_form", "linear"),
+                momentum=config["training"].get("loss_sw_momentum", 0.9),
+                w_min=config["training"].get("loss_sw_min", 0.1),
+                w_max=config["training"].get("loss_sw_max", 5.0),
+                start_epoch=config["training"].get("loss_sw_start_epoch", 0),
+            )
+        # Tail-MAE diagnostic: unweighted MAE on high-target (minority) samples
+        self.tail_quantile = config["training"].get("loss_sw_tail_quantile", 0.95)
+        self._tail_threshold = None
 
         # Loss weights
         self.lam = config["training"].get("lam", 1.0)
@@ -275,35 +331,41 @@ class EncoderForecaster(pl.LightningModule):
         if self.show_trg_max_idx is not None:
             mse_mask = torch.logical_not(trg_nan)
 
-        # Gaussian NLL (scalar head): channels are (mu, raw_sigma)
-        if self.config["training"]["loss_fn"] == "gaussian":
+        # Gaussian / lognormal NLL (scalar head): channels are (mu, raw_sigma)
+        if self.config["training"]["loss_fn"] in ("gaussian", "lognormal"):
             mu = forecast_output[:, :, 0]
             raw_sigma = forecast_output[:, :, 1]
             # trg_val is (B, L_dec) with the scalar targets in the first
             # output_dim columns; reshape to (B, D) for the loss
             trg_scalar = trg_val[:, :self.model.output_dim]
-            loss = self.loss_fn(mu, raw_sigma, trg_scalar)
-            predicted_value = mu
+            sw = self._train_sample_weights(stage, mu, raw_sigma, trg_scalar)
+            loss = self.loss_fn(mu, raw_sigma, trg_scalar, sample_weight=sw)
+            # log-space losses: report the median in y-space as point forecast
+            predicted_value = torch.exp(mu) - self.log_shift if self.log_space_loss else mu
             trg = torch.nan_to_num(trg_scalar)
             mse_mask = torch.logical_not(torch.isnan(trg_scalar))
-        # Censored Gaussian NLL: channels are (mu, raw_sigma), the failure mask
+        # Censored NLL: channels are (mu, raw_sigma), the failure mask
         # is derived from the value distribution (no independent BCE head)
         elif self.censored_loss:
             mu = forecast_output[:, :, 0]
             raw_sigma = forecast_output[:, :, 1]
+            # log-space losses: report the median in y-space as point forecast
+            point = torch.exp(mu) - self.log_shift if self.log_space_loss else mu
 
             # scalar head: the target is a D-dimensional vector of scalars
             if self.model.head_type == "scalar":
                 # trg_val is (B, L_dec) with the scalar targets in the first
                 # output_dim columns; reshape to (B, D) for the loss
                 trg_scalar = trg_val[:, :self.model.output_dim]
-                loss = self.loss_fn(mu, raw_sigma, trg_scalar)
-                predicted_value = mu
+                sw = self._train_sample_weights(stage, mu, raw_sigma, trg_scalar)
+                loss = self.loss_fn(mu, raw_sigma, trg_scalar, sample_weight=sw)
+                predicted_value = point
                 trg = torch.nan_to_num(trg_scalar)
                 mse_mask = torch.logical_not(torch.isnan(trg_scalar))
             else:
-                loss = self.loss_fn(mu, raw_sigma, trg_val)
-                predicted_value = mu
+                sw = self._train_sample_weights(stage, mu, raw_sigma, trg_val)
+                loss = self.loss_fn(mu, raw_sigma, trg_val, sample_weight=sw)
+                predicted_value = point
                 trg = torch.nan_to_num(trg_val)
                 # metrics on observed (non-censored) positions only
                 mse_mask = torch.logical_not(trg_nan)
@@ -316,7 +378,8 @@ class EncoderForecaster(pl.LightningModule):
             bce = bce_loss_fn(Y2_hat, trg_nan.float())
 
             # only valid, non-NaN targets contribute; optional position weighting
-            mse = self.loss_fn(Y1_hat, trg_val)
+            sw = self._train_sample_weights(stage, Y1_hat, trg_val)
+            mse = self.loss_fn(Y1_hat, trg_val, sample_weight=sw)
 
             loss = mse + self.lam * bce
             predicted_value = Y1_hat
@@ -326,7 +389,8 @@ class EncoderForecaster(pl.LightningModule):
             predicted_value = forecast_output.squeeze(-1)
             trg = torch.nan_to_num(trg_val)
 
-            loss = self.loss_fn(predicted_value, trg_val)
+            sw = self._train_sample_weights(stage, predicted_value, trg_val)
+            loss = self.loss_fn(predicted_value, trg_val, sample_weight=sw)
 
         # Log metrics
         for name, metric in [("mae", self.mae), ("rmse", self.rmse), ("r2", self.r2)]:
@@ -339,17 +403,59 @@ class EncoderForecaster(pl.LightningModule):
                     prog_bar=(stage == "val"))
 
         # Log the NLL as a metric for best-checkpoint selection (probabilistic losses)
-        if self.config["training"]["loss_fn"] in ("gaussian", "gaussian_censored"):
+        if self.config["training"]["loss_fn"] in (
+            "gaussian", "gaussian_censored", "lognormal", "lognormal_censored"
+        ):
             self.log(f"{stage}_nll", loss, on_step=False, on_epoch=True,
                      prog_bar=(stage == "val"))
 
         # Log entropy statistics
         self.log(f"{stage}_enc_self_entropy", enc_self, on_step=False, on_epoch=True, prog_bar=False)
 
+        # Tail-MAE diagnostic (unweighted, minority high-target samples)
+        self._log_tail_mae(stage, predicted_value, trg_val)
+
         # Add entropy regularization to loss
         loss = loss + self.gamma * ent_regularizer
 
         return loss, predicted_value, Y
+
+    def on_train_start(self):
+        """Compute the tail threshold on the training fold (in-memory tensors)."""
+        dm = getattr(self.trainer, "datamodule", None)
+        train_ds = getattr(dm, "train_ds", None) if dm is not None else None
+        if train_ds is None or not hasattr(train_ds, "tensors"):
+            return
+        targets = train_ds.tensors[1][:, :, self.dec_val_idx]
+        s = summarize_target(targets, "max")
+        s = s[torch.isfinite(s)]
+        if s.numel() > 0:
+            self._tail_threshold = torch.quantile(s.float(), self.tail_quantile).item()
+
+    def _train_sample_weights(self, stage, *loss_args):
+        """Per-sample loss weights (B, 1) for training; None otherwise."""
+        if stage != "train" or self.adaptive_weighter is None:
+            return None
+        per_sample = self.loss_fn.per_sample(*loss_args)
+        w = self.adaptive_weighter(per_sample, self.current_epoch)
+        self.adaptive_weighter.update(per_sample)
+        self.log("train_sw_mean", w.mean(), on_step=False, on_epoch=True)
+        self.log("train_sw_frac_boosted", (w > 1.5).float().mean(),
+                 on_step=False, on_epoch=True)
+        return w
+
+    def _log_tail_mae(self, stage, predicted_value, target_raw):
+        """Unweighted MAE on minority (high-target) samples; train-fold threshold."""
+        if stage not in ("val", "test") or self._tail_threshold is None:
+            return
+        s = summarize_target(target_raw, "max")  # (B,)
+        tail = (s >= self._tail_threshold) & torch.isfinite(s)
+        valid = ~torch.isnan(target_raw)
+        m = valid & tail.unsqueeze(1)
+        if not m.any():
+            return
+        mae_tail = (predicted_value[m] - torch.nan_to_num(target_raw)[m]).abs().mean()
+        self.log(f"{stage}_mae_tail", mae_tail, on_step=False, on_epoch=True)
 
     def training_step(self, batch, batch_idx):
         """

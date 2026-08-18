@@ -244,9 +244,11 @@ class BasePredictor(ABC):
             target_list.append(trg.cpu())
             
             # Collect attention weights if available
+            # Note: entries can be None (e.g. encoder-only models have no
+            # decoder attention), so guard against None before .cpu()
             if processed.get('attention_weights') is not None:
                 for key in ['encoder', 'decoder', 'cross']:
-                    if key in processed['attention_weights']:
+                    if key in processed['attention_weights'] and processed['attention_weights'][key] is not None:
                         attention_dict[key].append(processed['attention_weights'][key].cpu())
             
             if debug_flag:

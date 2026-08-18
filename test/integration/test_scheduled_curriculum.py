@@ -119,5 +119,83 @@ def test_censored_gaussian_loss_run(temp_output_dir):
             f"{col} must be finite: {result_df[col].tolist()}"
 
 
+def test_censored_lognormal_loss_run(temp_output_dir):
+    """loss_fn="lognormal_censored" trains end-to-end with finite losses."""
+    config = OmegaConf.load(CONFIG_PATH)
+    config_dev = modify_config_for_fast_testing(
+        config, max_epochs=2, k_fold=2, max_data_size=10
+    )
+
+    # Censored log-normal NLL (lognormal Tobit): channels are (mu, raw_sigma)
+    # with mu parameterizing log(y + shift)
+    config_dev["training"]["loss_fn"] = "lognormal_censored"
+    config_dev["training"]["loss_censor_threshold"] = 1.0
+    config_dev["training"]["loss_bce_on_observed"] = False
+    config_dev["training"]["loss_log_shift"] = 1e-3
+
+    config_updated = update_config(config_dev)
+
+    result_df = trainer(
+        config=config_updated,
+        data_dir=str(DATA_DIR),
+        save_dir=temp_output_dir,
+        cluster=False,
+        experiment_tag="test_censored_lognormal",
+        plot_pred_check=False,
+        debug=False,
+        best=True,
+    )
+
+    assert len(result_df) == 2, "Both folds should complete"
+    for col in ("train_loss", "val_loss", "val_mae"):
+        assert col in result_df.columns
+        assert result_df[col].map(lambda v: v == v and abs(v) != float("inf")).all(), \
+            f"{col} must be finite: {result_df[col].tolist()}"
+
+
+def test_adaptive_sample_weight_run(temp_output_dir):
+    """loss_fn="lognormal_censored" + loss_sample_weight="adaptive" trains
+    end-to-end with finite losses and finite weight diagnostics."""
+    config = OmegaConf.load(CONFIG_PATH)
+    config_dev = modify_config_for_fast_testing(
+        config, max_epochs=2, k_fold=2, max_data_size=10
+    )
+
+    config_dev["training"]["loss_fn"] = "lognormal_censored"
+    config_dev["training"]["loss_censor_threshold"] = 1.0
+    config_dev["training"]["loss_log_shift"] = 1e-3
+    config_dev["training"]["loss_sample_weight"] = "adaptive"
+    config_dev["training"]["loss_sw_gamma"] = 1.0
+    config_dev["training"]["loss_sw_max"] = 5.0
+
+    config_updated = update_config(config_dev)
+
+    result_df = trainer(
+        config=config_updated,
+        data_dir=str(DATA_DIR),
+        save_dir=temp_output_dir,
+        cluster=False,
+        experiment_tag="test_adaptive_sw",
+        plot_pred_check=False,
+        debug=False,
+        best=True,
+    )
+
+    assert len(result_df) == 2, "Both folds should complete"
+    for col in ("val_loss", "val_mae"):
+        assert col in result_df.columns
+        assert result_df[col].map(lambda v: v == v and abs(v) != float("inf")).all(), \
+            f"{col} must be finite: {result_df[col].tolist()}"
+
+    # weight diagnostics must have been logged during training
+    csv_path = os.path.join(
+        temp_output_dir, "k_0", "logs", "csv", "version_0", "metrics.csv"
+    )
+    csv = pd.read_csv(csv_path)
+    assert "train_sw_mean" in csv.columns, "sample-weight diagnostics should be logged"
+    logged = csv["train_sw_mean"].dropna()
+    assert len(logged) > 0 and (logged > 0).all()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
