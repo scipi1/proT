@@ -138,3 +138,20 @@ class TestGradientsAndWeighting:
         raw_sigma = torch.zeros(2, 5)
         target = torch.full((2, 5), float("nan"))
         assert torch.isfinite(loss_fn(mu, raw_sigma, target))
+
+    def test_var_reg_forms(self):
+        """var_reg penalizes raw_sigma^2 or sigma^2 depending on the form."""
+        mu = torch.tensor([[0.0]])
+        raw_sigma = torch.tensor([[1.5]])
+        target = torch.tensor([[0.5]])
+
+        plain = CensoredGaussianNLL(var_reg=0.0)(mu, raw_sigma, target)
+        reg_raw = CensoredGaussianNLL(var_reg=0.1, var_reg_form="raw_sigma")(
+            mu, raw_sigma, target)
+        reg_sig = CensoredGaussianNLL(var_reg=0.1, var_reg_form="sigma")(
+            mu, raw_sigma, target)
+
+        assert reg_raw.item() == pytest.approx(plain.item() + 0.1 * 1.5 ** 2, rel=1e-5)
+        sigma = F.softplus(raw_sigma) + 1e-3
+        assert reg_sig.item() == pytest.approx(
+            plain.item() + 0.1 * sigma.item() ** 2, rel=1e-5)

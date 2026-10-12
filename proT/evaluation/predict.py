@@ -520,8 +520,12 @@ def predict(
     
     # select dataset
     if dataset_label == "train":
-        dataset = dm.train_dataloader()
-        print("Train dataset selected.")
+        # deterministic (unshuffled) order for reproducible cached predictions
+        dataset = dm.eval_train_dataloader()
+        print("Train dataset selected (deterministic order).")
+    elif dataset_label == "val":
+        dataset = dm.val_dataloader()
+        print("Validation dataset selected.")
     elif dataset_label == "test":
         dataset = dm.test_dataloader()
         print("Test dataset selected (default).")

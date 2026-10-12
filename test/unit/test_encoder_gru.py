@@ -23,9 +23,9 @@ from proT.training.losses import CensoredGaussianNLL
 def _tiny_config(head_type="gru", output_dim=None, d_hidden=8, rnn_n_layers=1,
                 out_dim=2, d_model_enc=16, d_model_dec=16, e_layers=2,
                 n_heads=2, d_qk=8, d_ff=32, dropout=0.0,
-                n_dec_vars=None, dec_var_idx=None):
-    """Tiny config for fast unit tests."""
-    return {
+                n_dec_vars=None, dec_var_idx=None, **extra):
+    """Tiny config for fast unit tests. Extra kwargs land in model kwargs."""
+    cfg = {
         "model": {
             "model_object": "proT_enc",
             "kwargs": {
@@ -89,6 +89,7 @@ def _tiny_config(head_type="gru", output_dim=None, d_hidden=8, rnn_n_layers=1,
                 "dec_pos_idx": 1,
                 "n_dec_vars": n_dec_vars,
                 "dec_var_idx": dec_var_idx,
+                **extra,
             },
         },
         "training": {
@@ -114,6 +115,7 @@ def _tiny_config(head_type="gru", output_dim=None, d_hidden=8, rnn_n_layers=1,
             "pos_idx": 1,
         },
     }
+    return cfg
 
 
 def _tiny_batch(B=4, L_enc=6, L_dec=10, D_enc=3, D_dec=4, nan_tail=False):
@@ -290,8 +292,26 @@ class TestProTEncoderPerVar:
         model = ProTEncoder(**cfg["model"]["kwargs"])
         assert isinstance(model.rnn, torch.nn.ModuleList) and len(model.rnn) == 2
         assert isinstance(model.rnn_head, torch.nn.ModuleList) and len(model.rnn_head) == 2
-        # the h0 projection produces n_dec_vars * n_layers * d_hidden values
-        assert model.h0_projection.out_features == 2 * 1 * 8
+        # the h0 projection is shared across variables: it maps each variable's
+        # context slice (n_ctx_queries * d_model_enc) to n_layers * d_hidden
+        assert model.h0_projection.out_features == 1 * 8
+
+    def test_gru_per_var_multi_ctx_queries_and_feed(self):
+        """C1+P1: k pool queries per variable, context MLP, per-step ctx feed."""
+        cfg = self._pervar_config(n_ctx_queries=4, ctx_mlp_hidden=16,
+                                  rnn_ctx_feed=True, rnn_ctx_feed_dim=6)
+        model = ProTEncoder(**cfg["model"]["kwargs"])
+        # 2 variables x 4 queries
+        assert model.pool_query.shape == (1, 8, model.pool_query.shape[-1])
+        # GRU input grows by the ctx-feed dim w.r.t. the baseline (no feed)
+        base = ProTEncoder(**self._pervar_config()["model"]["kwargs"])
+        assert model.rnn[0].input_size == base.rnn[0].input_size + 6
+        X, Y = _tiny_batch_pervar(L_per_var=5)
+        trg_pos_mask = (Y[:, :, 1] > 2).unsqueeze(-1)
+        out, _, _, _, _ = model.forward(
+            input_tensor=X, target_tensor=Y, trg_pos_mask=trg_pos_mask)
+        assert out.shape == (Y.shape[0], Y.shape[1], 2)
+        assert torch.isfinite(out).all()
 
     def test_gru_per_var_teacher_forcing_boundary(self):
         """Forced and free runs must differ after the forcing boundary (both variables)."""
@@ -393,12 +413,12 @@ class TestEncoderForecaster:
         cfg = _tiny_config(head_type="gru")
         forecaster = EncoderForecaster(cfg)
         # before curriculum start
-        assert forecaster._scheduled_bound(0) == 5
-        assert forecaster._scheduled_bound(2) == 5
+        assert forecaster.curriculum.scheduled_bound(0) == 5
+        assert forecaster.curriculum.scheduled_bound(2) == 5
         # at the end
-        assert forecaster._scheduled_bound(9) == 0
+        assert forecaster.curriculum.scheduled_bound(9) == 0
         # monotonic decrease
-        bounds = [forecaster._scheduled_bound(e) for e in range(2, 10)]
+        bounds = [forecaster.curriculum.scheduled_bound(e) for e in range(2, 10)]
         assert all(b1 >= b2 for b1, b2 in zip(bounds, bounds[1:]))
 
     def test_real_ist_inference(self):
@@ -468,6 +488,345 @@ class TestEncoderForecaster:
         out1, _, _, _, _ = forecaster.forward(data_input=X, data_trg=Y)
         out2, _, _, _, _ = loaded.forward(data_input=X, data_trg=Y)
         assert torch.allclose(out1, out2)  # type: ignore
+
+
+# ---------------------------------------------------------------------------
+# Delta (incremental) output mode
+# ---------------------------------------------------------------------------
+
+def _delta_config(head_type="gru", monotone=False, **kw):
+    cfg = _tiny_config(head_type=head_type, out_dim=2, **kw)
+    cfg["model"]["kwargs"]["rnn_output_mode"] = "delta"
+    cfg["model"]["kwargs"]["rnn_monotone"] = monotone
+    return cfg
+
+
+def _sigma(out, eps=1e-3):
+    """Loss convention: sigma = softplus(raw_sigma) + eps."""
+    return F.softplus(out[:, :, 1]) + eps
+
+
+class TestDeltaMode:
+
+    def test_output_shapes_and_variance_accumulation(self):
+        """Without forcing, the cumulative sigma must be non-decreasing."""
+        cfg = _delta_config()
+        forecaster = EncoderForecaster(cfg)
+        forecaster.eval()
+        X, Y = _tiny_batch()
+        with torch.no_grad():
+            out, _, _, _, _ = forecaster.forward(data_input=X, data_trg=Y)
+        assert out.shape == (4, 10, 2)
+        sigma = _sigma(out)
+        assert torch.all(sigma[:, 1:] >= sigma[:, :-1] - 1e-6)
+        assert forecaster.model.last_step_deltas.shape == (4, 10, 2)
+
+    def test_cumulative_matches_increment_cumsum(self):
+        """With nothing given, mu channel = cumsum(delta_mu), sigma channel
+        = sqrt(cumsum(delta_var))."""
+        cfg = _delta_config()
+        forecaster = EncoderForecaster(cfg)
+        forecaster.eval()
+        X, Y = _tiny_batch()
+        with torch.no_grad():
+            out, _, _, _, _ = forecaster.forward(data_input=X, data_trg=Y)
+        d = forecaster.model.last_step_deltas
+        # increment variance: sigma_inc = softplus(raw) + eps = sqrt(d_var)
+        d_var = (F.softplus(d[:, :, 1]) + 1e-3) ** 2
+        mu_cum, sigma_cum = ProTEncoder.increments_to_cumulative(
+            d[:, :, 0], d_var)
+        assert torch.allclose(out[:, :, 0], mu_cum, atol=1e-5)
+        assert torch.allclose(_sigma(out), sigma_cum, atol=1e-4)
+
+    def test_variance_reset_under_forcing(self):
+        """After a given (measured) position the variance restarts from zero:
+        at the first hidden position the cumulative sigma equals the single
+        increment sigma."""
+        cfg = _delta_config()
+        forecaster = EncoderForecaster(cfg)
+        forecaster.eval()
+        forecaster.show_trg_active = True
+        forecaster.show_trg_max_idx = 4  # positions 1..4 given (idx 0..3)
+        X, Y = _tiny_batch(L_dec=10)
+        with torch.no_grad():
+            out, _, _, _, _ = forecaster.forward(
+                data_input=X, data_trg=Y, predict_mode=True)
+        d = forecaster.model.last_step_deltas
+        inc_sigma = F.softplus(d[:, :, 1]) + 1e-3
+        cum_sigma = _sigma(out)
+        # first hidden position (idx 4): cumulative == single increment
+        assert torch.allclose(cum_sigma[:, 4], inc_sigma[:, 4], atol=1e-4)
+        # later hidden positions keep accumulating
+        assert torch.all(cum_sigma[:, 5:] >= cum_sigma[:, 4:5] - 1e-6)
+
+    def test_monotone_addon(self):
+        """rnn_monotone constrains delta_mu >= 0: the path is non-decreasing."""
+        cfg = _delta_config(monotone=True)
+        forecaster = EncoderForecaster(cfg)
+        forecaster.eval()
+        X, Y = _tiny_batch()
+        with torch.no_grad():
+            out, _, _, _, _ = forecaster.forward(data_input=X, data_trg=Y)
+        mu = out[:, :, 0]  # y-space here (gaussian_censored)
+        assert torch.all(mu[:, 1:] >= mu[:, :-1] - 1e-6)
+
+    def test_increment_targets(self):
+        """_increment_targets must match the diff of the (y-space) target."""
+        cfg = _delta_config()
+        forecaster = EncoderForecaster(cfg)
+        X, Y = _tiny_batch()
+        d = forecaster._increment_targets(Y)
+        y = Y[:, :, 2]
+        assert torch.allclose(d[:, 0], y[:, 0])
+        assert torch.allclose(d[:, 1:], y[:, 1:] - y[:, :-1])
+
+    def test_increment_targets_per_var(self):
+        """gru_per_var: increments restart from base 0 at variable boundaries
+        and NaN (censored) positions propagate."""
+        cfg = _delta_config(head_type="gru_per_var", n_dec_vars=2, dec_var_idx=0)
+        forecaster = EncoderForecaster(cfg)
+        X, Y = _tiny_batch_pervar(nan_tail=True)  # L=10, blocks of 5
+        d = forecaster._increment_targets(Y)
+        y = Y[:, :, 2]
+        assert torch.allclose(d[:, 0], y[:, 0])
+        assert torch.allclose(d[:, 1:4], y[:, 1:4] - y[:, 0:3])
+        assert torch.allclose(d[:, 5], y[:, 5])          # var boundary: base 0
+        assert torch.isnan(d[:, 4]).all()                # censored position
+        assert torch.isnan(d[:, 9]).all()
+
+    @pytest.mark.parametrize("head_type,kw", [
+        ("gru", {}),
+        ("gru_per_var", {"n_dec_vars": 2, "dec_var_idx": 0}),
+    ])
+    def test_step_and_backward(self, head_type, kw):
+        """The combined cumulative + increment loss is finite and trains."""
+        cfg = _delta_config(head_type=head_type, **kw)
+        forecaster = EncoderForecaster(cfg)
+        forecaster.train()
+        X, Y = _tiny_batch(nan_tail=True) if head_type == "gru" \
+            else _tiny_batch_pervar(nan_tail=True)
+        loss, predicted, _ = forecaster._step((X, Y), stage="train")
+        assert torch.isfinite(loss)
+        loss.backward()
+        assert forecaster.model.rnn_head.weight.grad is not None \
+            if head_type == "gru" else \
+            forecaster.model.rnn_head[0].weight.grad is not None
+
+
+class TestDeltaLogSpaceBase:
+    """Log-space base fix (delta mode + lognormal loss).
+
+    In log-space z = log(y + shift), so y = 0 maps to z = log(shift), NOT 0.
+    Before the fix the rollout state and the increment-target base were
+    initialized at z = 0 (y ~ 1), making the first increment of every curve
+    ~ -6.9 and unmatchable for a monotone (delta_mu >= 0) head.
+    """
+
+    SHIFT = 1e-3
+
+    def _cfg(self, head_type="gru", monotone=True, **kw):
+        cfg = _delta_config(head_type=head_type, monotone=monotone, **kw)
+        cfg["training"]["loss_fn"] = "lognormal_censored"
+        cfg["training"]["loss_log_shift"] = self.SHIFT
+        return cfg
+
+    @staticmethod
+    def _smooth_batch(B=4, L_dec=10, D_dec=4, nan_tail=False):
+        """Monotone targets starting exactly at 0 (like the idealized ISTs)."""
+        Y = torch.zeros(B, L_dec, D_dec)
+        Y[:, :, 0] = torch.randint(1, 3, (B, L_dec)).float()
+        Y[:, :, 1] = torch.arange(1, L_dec + 1).float().unsqueeze(0).expand(B, -1)
+        Y[:, :, 2] = 0.05 * (Y[:, :, 1] - 1) * torch.rand(B, 1)  # monotone from 0
+        Y[:, :, 3] = 0.0
+        if nan_tail:
+            Y[:, -2:, 2] = float("nan")
+        X = torch.randn(B, 6, 3)
+        X[:, :, 0] = torch.randint(1, 5, (B, 6)).float()
+        X[:, :, 2] = torch.arange(6).float().unsqueeze(0).expand(B, -1)
+        return X, Y
+
+    def test_increment_targets_logspace_base(self):
+        """d_0 = z_0 - log(shift); roundtrip cumsum(d) + log(shift) == z."""
+        forecaster = EncoderForecaster(self._cfg())
+        _, Y = self._smooth_batch()
+        d = forecaster._increment_targets(Y)
+        y = Y[:, :, 2]
+        z = torch.log(y + self.SHIFT)
+        z0 = math.log(self.SHIFT)
+        assert torch.allclose(d[:, 0], z[:, 0] - z0)
+        assert torch.allclose(d[:, 1:], z[:, 1:] - z[:, :-1])
+        # roundtrip: z0 + cumsum(increments) reconstructs z
+        assert torch.allclose(z0 + d.cumsum(dim=1), z)
+        # y_0 = 0 -> z_0 = log(shift) -> d_0 = 0 (matchable by monotone head)
+        assert torch.allclose(d[:, 0], torch.zeros_like(d[:, 0]), atol=1e-6)
+
+    def test_increment_targets_per_var_logspace_base(self):
+        """gru_per_var: the log(shift) base is used at variable boundaries."""
+        cfg = self._cfg(head_type="gru_per_var", n_dec_vars=2, dec_var_idx=0)
+        forecaster = EncoderForecaster(cfg)
+        _, Y = self._smooth_batch()
+        # variable blocks of 5
+        Y[:, :, 0] = torch.cat([torch.ones(5), torch.full((5,), 2.0)])
+        Y[:, :, 1] = torch.arange(1, 6).float().repeat(2)
+        d = forecaster._increment_targets(Y)
+        z = torch.log(Y[:, :, 2] + self.SHIFT)
+        z0 = math.log(self.SHIFT)
+        assert torch.allclose(d[:, 0], z[:, 0] - z0)
+        assert torch.allclose(d[:, 5], z[:, 5] - z0)      # boundary: base z0
+        assert torch.allclose(d[:, 1:5], z[:, 1:5] - z[:, 0:4])
+        assert torch.allclose(d[:, 6:], z[:, 6:] - z[:, 5:-1])
+
+    def test_increment_targets_yspace_unchanged(self):
+        """Gaussian (y-space) delta mode keeps the base-0 convention."""
+        forecaster = EncoderForecaster(_delta_config())
+        _, Y = self._smooth_batch()
+        d = forecaster._increment_targets(Y)
+        y = Y[:, :, 2]
+        assert torch.allclose(d[:, 0], y[:, 0])
+        assert torch.allclose(d[:, 1:], y[:, 1:] - y[:, :-1])
+
+    def test_rollout_init_at_log_shift(self):
+        """With a zeroed head (d_mu = 0, non-monotone) and nothing given, the
+        cumulative mu stays at log(shift) -> y-median exactly 0."""
+        forecaster = EncoderForecaster(self._cfg(monotone=False))
+        forecaster.eval()
+        model = forecaster.model
+        assert model.feedback_shift == self.SHIFT
+        assert model._delta_z0() == pytest.approx(math.log(self.SHIFT))
+        with torch.no_grad():
+            model.rnn_head.weight.zero_()
+            model.rnn_head.bias.zero_()
+        X, Y = self._smooth_batch()
+        with torch.no_grad():
+            out, _, _, _, _ = forecaster.forward(data_input=X, data_trg=Y)
+        assert torch.allclose(out[:, :, 0],
+                              torch.full_like(out[:, :, 0],
+                                              math.log(self.SHIFT)),
+                              atol=1e-6)
+        # y-space median = exp(mu) - shift = 0: the init expresses y = 0
+        median = torch.exp(out[:, :, 0]) - self.SHIFT
+        assert torch.allclose(median, torch.zeros_like(median), atol=1e-7)
+
+    def test_rollout_init_yspace_unchanged(self):
+        """Gaussian delta mode: zeroed head -> cumulative mu stays at 0."""
+        forecaster = EncoderForecaster(_delta_config(monotone=False))
+        forecaster.eval()
+        model = forecaster.model
+        assert model.feedback_shift is None
+        assert model._delta_z0() == 0.0
+        with torch.no_grad():
+            model.rnn_head.weight.zero_()
+            model.rnn_head.bias.zero_()
+        X, Y = self._smooth_batch()
+        with torch.no_grad():
+            out, _, _, _, _ = forecaster.forward(data_input=X, data_trg=Y)
+        assert torch.allclose(out[:, :, 0], torch.zeros_like(out[:, :, 0]),
+                              atol=1e-6)
+
+    def test_rollout_init_per_var(self):
+        """Same init check for the gru_per_var rollout (both variables)."""
+        cfg = self._cfg(head_type="gru_per_var", monotone=False,
+                        n_dec_vars=2, dec_var_idx=0)
+        forecaster = EncoderForecaster(cfg)
+        forecaster.eval()
+        model = forecaster.model
+        for head in model.rnn_head:
+            with torch.no_grad():
+                head.weight.zero_()
+                head.bias.zero_()
+        X, Y = self._smooth_batch()
+        Y[:, :, 0] = torch.cat([torch.ones(5), torch.full((5,), 2.0)])
+        Y[:, :, 1] = torch.arange(1, 6).float().repeat(2)
+        with torch.no_grad():
+            out, _, _, _, _ = forecaster.forward(data_input=X, data_trg=Y)
+        assert torch.allclose(out[:, :, 0],
+                              torch.full_like(out[:, :, 0],
+                                              math.log(self.SHIFT)),
+                              atol=1e-6)
+
+    def test_increments_to_cumulative_z0(self):
+        """increments_to_cumulative honors the z0 start (default 0)."""
+        d_mu = torch.randn(3, 7).abs()
+        d_var = torch.rand(3, 7)
+        mu0, s0 = ProTEncoder.increments_to_cumulative(d_mu, d_var)
+        mu1, s1 = ProTEncoder.increments_to_cumulative(
+            d_mu, d_var, z0=math.log(self.SHIFT))
+        assert torch.allclose(mu0, d_mu.cumsum(dim=1))
+        assert torch.allclose(mu1, math.log(self.SHIFT) + d_mu.cumsum(dim=1))
+        assert torch.allclose(s0, s1)
+
+    @pytest.mark.parametrize("head_type,kw", [
+        ("gru", {}),
+        ("gru_per_var", {"n_dec_vars": 2, "dec_var_idx": 0}),
+    ])
+    def test_step_and_backward_logspace(self, head_type, kw):
+        """Full train step with lognormal_censored + delta on smooth targets:
+        finite loss, finite gradients."""
+        cfg = self._cfg(head_type=head_type, **kw)
+        forecaster = EncoderForecaster(cfg)
+        forecaster.train()
+        X, Y = self._smooth_batch(nan_tail=True)
+        if head_type == "gru_per_var":
+            Y[:, :, 0] = torch.cat([torch.ones(5), torch.full((5,), 2.0)])
+            Y[:, :, 1] = torch.arange(1, 6).float().repeat(2)
+            Y[:, 4, 2] = float("nan")
+            Y[:, 9:, 2] = float("nan")
+        loss, _, _ = forecaster._step((X, Y), stage="train")
+        assert torch.isfinite(loss)
+        loss.backward()
+        grads = [p.grad for p in forecaster.parameters() if p.grad is not None]
+        assert grads and all(torch.isfinite(g).all() for g in grads)
+
+
+class TestDrawWindow:
+    """Random-draw window (show_trg_draw_lower/upper) of the forcing curriculum."""
+
+    def _curriculum(self, **kw):
+        from proT.training.curriculum import ForcingCurriculum
+        defaults = dict(mode="scheduled", units="fraction", epoch_show_trg=0,
+                        max_epochs=10, start=0.9, end=0.0, random_draw=True)
+        defaults.update(kw)
+        return ForcingCurriculum(**defaults)
+
+    def test_draw_within_window(self):
+        cur = self._curriculum(draw_lower=0.7, draw_upper=0.9)
+        for _ in range(50):
+            b = cur.draw(0)  # warmup-free: epoch 0 -> bound = start = 0.9
+            assert 0.7 <= b <= 0.9
+
+    def test_default_window_unchanged(self):
+        cur = self._curriculum()
+        for _ in range(50):
+            b = cur.draw(0)
+            assert 0.0 <= b <= 0.9
+
+    def test_window_collapses_below_bound(self):
+        """Once the annealed bound falls below draw_lower, the draw returns
+        the bound itself (no invalid range)."""
+        cur = self._curriculum(draw_lower=0.7, draw_upper=0.9)
+        assert cur.draw(9) == 0.0  # end of schedule: bound 0, no draw
+
+    def test_window_clamped_to_annealed_bound(self):
+        cur = self._curriculum(draw_lower=0.7, draw_upper=0.9, max_epochs=11)
+        # mid-schedule bound ~0.45 < draw_lower: window collapses to the bound
+        for _ in range(20):
+            b = cur.draw(5)
+            assert 0.0 <= b <= 0.5
+
+    def test_draw_lower_anneals(self):
+        """The lower window end anneals draw_lower -> draw_lower_end on the
+        bound's schedule: [0.85, 0.9] at start, widening down to 0 at end."""
+        cur = self._curriculum(draw_lower=0.85, draw_lower_end=0.0, max_epochs=11)
+        assert cur._draw_lower_at(0) == 0.85
+        assert abs(cur._draw_lower_at(5) - 0.425) < 1e-6  # linear midpoint
+        assert cur._draw_lower_at(10) == 0.0
+        lows, highs = [], []
+        for _ in range(50):
+            b0, b5, b10 = cur.draw(0), cur.draw(5), cur.draw(10)
+            lows.append((b0, b5, b10))
+        assert all(0.85 <= b <= 0.9 for b, _, _ in lows)   # start: [0.85, 0.9]
+        assert all(0.425 <= b <= 0.45 for _, b, _ in lows)  # mid: [0.425, 0.45]
+        assert all(b == 0.0 for _, _, b in lows)            # end: collapsed to 0
 
 
 if __name__ == "__main__":

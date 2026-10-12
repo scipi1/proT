@@ -9,6 +9,10 @@ import pytorch_lightning as pl
 
 from os.path import join
 
+from proT.training.hard_mining import (
+    HardMiningBatchSampler, HardMiningState, IndexedTensorDataset,
+)
+
 
 
 class ProcessDataModule(pl.LightningDataModule):
@@ -65,6 +69,8 @@ class ProcessDataModule(pl.LightningDataModule):
         self.val_ds = None
         self.test_ds = None
         self.ds_length = None
+        # Hard-example mining state (injected by trainer.py per fold; None = off)
+        self.hard_mining_state: HardMiningState | None = None
         
         
     def prepare_data(self) -> None:
@@ -77,13 +83,22 @@ class ProcessDataModule(pl.LightningDataModule):
         """
         # Check if pre-split data is provided
         if self.train_file is not None or self.test_file is not None:
+
+            # Idempotency guard: prepare_data() is called both by the Lightning
+            # hook and explicitly by setup(). Reloading rebuilds
+            # train_ds/val_ds/test_ds from the full files and would silently
+            # discard a k-fold split installed via update_idx(), so return early
+            # once the tensors are already in place.
+            if self.X_train_tensor is not None and self.X_test_tensor is not None:
+                return
+
             print("Loading pre-split data.")
-            
-            # Reset any indices to prevent further splitting
-            self.train_idx = None
-            self.val_idx = None
-            self.test_idx = None
-            
+
+            # NOTE: the split indices are deliberately NOT reset here. Resetting
+            # them made split_ds() fall through to auto_split_ds(), which
+            # re-partitions train+test at random -> the k-fold split was lost
+            # and test samples leaked into the training set (see split_ds).
+
             if self.train_file is not None and self.test_file is not None:
                 
                 # TRAIN
@@ -136,7 +151,13 @@ class ProcessDataModule(pl.LightningDataModule):
         
         # Normal data loading (not pre-split)
         else:
-            
+
+            # Idempotency guard (see the pre-split branch above): never reload
+            # and rebuild all_ds once the tensors exist, so an externally
+            # installed split survives the setup() -> prepare_data() call.
+            if self.X_tensor is not None and self.Y_tensor is not None:
+                return
+
             if self.input_file == self.target_file:
                 print("Dataset in one numpy file.")
                 loaded = np.load(join(self.data_dir, self.input_file), allow_pickle=True, mmap_mode='r')
@@ -240,6 +261,15 @@ class ProcessDataModule(pl.LightningDataModule):
         - If True: 60% train, 20% val, 20% test
         - If False: 80% train, 20% test (for k-fold CV)
         """
+        # Fail loudly instead of silently leaking: in pre-split mode the test
+        # set is defined by test_file and must never be re-drawn from
+        # all_ds = train (+) test.
+        assert self.X_train_tensor is None, (
+            "auto_split_ds() called in pre-split mode (train_file/test_file set). "
+            "This would randomly re-partition train+test and leak test data into "
+            "the training set. Use the pre-split datasets or update_idx() instead."
+        )
+
         if self.use_val_split:
             # Split into train/val/test (0.6/0.2/0.2)
             self.train_ds, self.val_ds, self.test_ds = random_split(
@@ -281,6 +311,21 @@ class ProcessDataModule(pl.LightningDataModule):
         if (self.X_tensor is None and self.Y_tensor is None) and (self.X_train_tensor is None and self.Y_train_tensor is None):
             raise ValueError("Tensors not loaded. Call setup() or prepare_data() first.")
         
+        # Pre-split data: train_ds/val_ds/test_ds were already built from the
+        # separate train/test files in prepare_data(). Automatic splitting must
+        # NEVER run here - auto_split_ds() re-partitions all_ds = train (+) test
+        # at random, which both destroys any k-fold split installed via
+        # update_idx() and leaks test samples into the training set.
+        if self.X_train_tensor is not None:
+            if self.train_idx is None and self.val_idx is None and self.test_idx is None:
+                assert self.train_ds is not None and self.test_ds is not None, (
+                    "Pre-split mode: datasets must be built by prepare_data() "
+                    "before split_ds() is called."
+                )
+                return  # keep the pre-split datasets as-is
+            self.idx_split()
+            return
+
         # If no indices provided, perform automatic splitting
         if self.train_idx is None and self.val_idx is None and self.test_idx is None:
             self.auto_split_ds()
@@ -323,12 +368,32 @@ class ProcessDataModule(pl.LightningDataModule):
         """
         Setup method called by PyTorch Lightning.
         Loads data (if not already loaded) and creates datasets.
+
+        Idempotent: both prepare_data() and split_ds() preserve an already
+        installed split (e.g. the per-fold indices set by trainer.py via
+        update_idx() before trainer.fit()), so calling setup() again never
+        re-partitions the data.
         """
         self.prepare_data()
         self.split_ds()
     
     
     def train_dataloader(self,):
+        # Hard-example mining: indexed dataset + batch sampler reserving a
+        # fraction of each batch for the worst-fitted samples. The sampler is
+        # rebuilt every epoch (reload_dataloaders_every_n_epochs=1 in the
+        # Trainer) so it sees the updated loss memory.
+        if self.hard_mining_state is not None:
+            ds = IndexedTensorDataset(self.train_ds)
+            sampler = HardMiningBatchSampler(
+                n_samples=len(ds), batch_size=self.batch_size,
+                state=self.hard_mining_state, seed=self.seed)
+            return DataLoader(
+                ds,
+                batch_sampler = sampler,
+                num_workers = self.num_workers,
+                persistent_workers = self.num_workers > 0,
+            )
         return DataLoader(
             self.train_ds,
             batch_size = self.batch_size,
@@ -337,6 +402,22 @@ class ProcessDataModule(pl.LightningDataModule):
             shuffle = True,
         )
     
+    def eval_train_dataloader(self):
+        """
+        Deterministic (unshuffled) loader over the training split.
+
+        Used for evaluation/prediction on the train split: train_dataloader()
+        shuffles (or applies hard-mining batch composition), which makes cached
+        prediction arrays non-reproducible and impossible to join by row index.
+        """
+        return DataLoader(
+            self.train_ds,
+            batch_size = self.batch_size,
+            num_workers = self.num_workers,
+            persistent_workers = self.num_workers > 0,
+            shuffle = False,
+        )
+
     def val_dataloader(self,):
         if self.val_ds is None:
             return None

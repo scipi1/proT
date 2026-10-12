@@ -587,25 +587,61 @@ class KFoldResultsTracker:
     Class to track and aggregate results across all k-folds.
     """
     
-    def __init__(self, save_dir: str, k_folds: int):
+    FOLD_FILE = "fold_result.json"
+
+    def __init__(self, save_dir: str, k_folds: int, best_metric: str = "val_mae"):
         self.save_dir = save_dir
         self.k_folds = k_folds
+        self.best_metric = best_metric  # lower is better
         self.fold_results = {}
         self.summary_file = join(save_dir, "kfold_summary.json")
-    
+
+    @staticmethod
+    def _to_py(v):
+        """Tensors / numpy scalars -> plain Python numbers (JSON-safe)."""
+        if hasattr(v, "item") and getattr(v, "ndim", 0) == 0:
+            return v.item()
+        return v
+
     def add_fold_result(self, fold_num: int, metrics: dict, best_checkpoint_path: str = None):
-        """Add results for a specific fold."""
-        self.fold_results[fold_num] = {
-            "metrics": metrics,
+        """Add results for a specific fold.
+
+        Each fold writes its own k_<n>/fold_result.json (no collisions between
+        parallel fold jobs); the summary is then rebuilt from ALL fold files
+        on disk, so the last job to finish leaves a complete summary.
+        """
+        result = {
+            "metrics": {k: self._to_py(v) for k, v in metrics.items()},
             "best_checkpoint_path": best_checkpoint_path,
             "fold_dir": join(self.save_dir, f"k_{fold_num}")
         }
-        
-        # Update summary file after each fold
+        fold_dir = join(self.save_dir, f"k_{fold_num}")
+        os.makedirs(fold_dir, exist_ok=True)
+        self._atomic_dump(result, join(fold_dir, self.FOLD_FILE))
+        self.fold_results[fold_num] = result
         self._update_summary()
-    
+
+    def collect(self):
+        """Load all k_<n>/fold_result.json found in save_dir."""
+        results = dict(self.fold_results)
+        for n in range(self.k_folds):
+            p = join(self.save_dir, f"k_{n}", self.FOLD_FILE)
+            if os.path.exists(p):
+                with open(p, "r") as f:
+                    results[n] = json.load(f)
+        return dict(sorted(results.items()))
+
+    @staticmethod
+    def _atomic_dump(obj, path):
+        """Write JSON via a temp file + rename (never a half-written file)."""
+        tmp = f"{path}.tmp{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump(obj, f, indent=2, default=str)
+        os.replace(tmp, path)
+
     def _update_summary(self):
-        """Update the k-fold summary file."""
+        """Rebuild the k-fold summary file from all fold results on disk."""
+        self.fold_results = self.collect()
         if not self.fold_results:
             return
         
@@ -631,20 +667,21 @@ class KFoldResultsTracker:
                     "max": float(np.max(values))
                 }
         
-        # Find best fold based on val_mae (lower is better)
-        if "val_mae" in metric_names:
-            best_fold = min(self.fold_results.keys(), 
-                           key=lambda x: self.fold_results[x]["metrics"]["val_mae"])
+        # Find best fold on best_metric (lower is better), fallback val_mae
+        sel = self.best_metric if self.best_metric in metric_names else "val_mae"
+        if sel in metric_names:
+            best_fold = min(self.fold_results.keys(),
+                            key=lambda x: self.fold_results[x]["metrics"][sel])
             summary["best_fold"] = {
                 "fold_number": best_fold,
-                "val_mae": self.fold_results[best_fold]["metrics"]["val_mae"],
+                "selection_metric": sel,
+                sel: self.fold_results[best_fold]["metrics"][sel],
+                "val_mae": self.fold_results[best_fold]["metrics"].get("val_mae"),
                 "metrics": self.fold_results[best_fold]["metrics"],
                 "checkpoint_path": self.fold_results[best_fold]["best_checkpoint_path"]
             }
-        
-        # Save summary to file
-        with open(self.summary_file, 'w') as f:
-            json.dump(summary, f, indent=2, default=str)
+
+        self._atomic_dump(summary, self.summary_file)
     
     def get_summary(self):
         """Get the current summary of all folds."""

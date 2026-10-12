@@ -1,3 +1,5 @@
+import os
+import warnings
 from math import sqrt, log
 import torch
 import torch.nn as nn
@@ -105,6 +107,17 @@ class ScaledDotAttention(nn.Module):
         
         # Scale the attention scores
         scaled_scores = scale * (scores + M_k)
+
+        # NaN-score guard: a NaN score means poisoned Q/K (e.g. non-finite
+        # weights after a bad update) - mask those keys to -inf so softmax
+        # stays finite; the all-(-inf)-row guard below then zeroes rows that
+        # lost every key this way. A NaN score would otherwise NaN the whole
+        # row through softmax (isinf(NaN) is False, so the -inf row guard
+        # alone does NOT catch it - this was the crash of run 16140288).
+        nan_scores = torch.isnan(scaled_scores)
+        n_nan_scores = int(nan_scores.sum())
+        if n_nan_scores:
+            scaled_scores = scaled_scores.masked_fill(nan_scores, -torch.inf)
         
         # Detect rows where ALL values are -inf (no valid attention targets)
         # This happens when causal mask + missing data masks block all positions
@@ -129,7 +142,16 @@ class ScaledDotAttention(nn.Module):
             att
         )
         
-        check_nan(att, "att_after_softmax")
+        # Robust NaN guard: warn with diagnostics and zero the NaN entries
+        # instead of crashing the run (see sanitize_nan; PROT_NAN_GUARD=raise
+        # restores the old hard-failure behavior for debugging)
+        att = sanitize_nan(
+            att,
+            name="att_after_softmax",
+            layer_name=self.layer_name,
+            n_nan_scores=n_nan_scores,
+            all_neginf_rows=all_neginf_rows,
+        )
         
         # Apply query mask and relu
         att = torch.relu(att + M_q)
@@ -405,22 +427,74 @@ def main():
     
     
     
-def check_nan(tensor: torch.Tensor, name: str) -> None:
-    """
-    Debug helper to detect NaN values in tensors during training.
-    
-    If NaN values are found, raises a RuntimeError with diagnostic info.
-    
+# NaN-guard configuration for sanitize_nan. The mode is read at call time so
+# it can be toggled without re-importing the module:
+#   PROT_NAN_GUARD=warn  (default) warn with diagnostics and zero NaN entries
+#   PROT_NAN_GUARD=raise           raise RuntimeError (debugging)
+_NAN_GUARD_ENV_VAR = "PROT_NAN_GUARD"
+_NAN_WARN_MAX = 20  # rate limit: at most this many full warnings per process
+_nan_warn_state = {"count": 0}
+
+
+def sanitize_nan(
+    tensor: torch.Tensor,
+    name: str,
+    layer_name: str = None,
+    n_nan_scores: int = 0,
+    all_neginf_rows: torch.Tensor = None,
+) -> torch.Tensor:
+    """Robust NaN guard for the attention weights (replaces check_nan).
+
+    A NaN in the attention weights is a symptom, not the disease: the Q/K
+    projections were already non-finite (upstream weight poisoning, e.g. a
+    bad optimizer step) or a masking path removed every key of a row.
+    Crashing the run (old check_nan) loses hours of compute over a
+    recoverable event, while silently continuing would hide a real problem.
+
+    Behavior (env var PROT_NAN_GUARD, default "warn"):
+      - "warn": emit a rate-limited warning with diagnostics and replace the
+        NaN entries with 0 (a poisoned query then contributes no attention
+        output; the residual stream of the encoder layer carries the rest).
+        Training continues.
+      - "raise": raise a RuntimeError with the same diagnostics (debugging).
+
     Args:
-        tensor: Tensor to check for NaN values
-        name: Descriptive name for the tensor (used in error message)
-        
-    Raises:
-        RuntimeError: If NaN values are detected in the tensor
+        tensor: Attention weights after softmax, (B, H, L, S) or (B, L, S).
+        name: Tensor label used in the message.
+        layer_name: Attention layer label (e.g. "enc_self_att", "pool_att").
+        n_nan_scores: Number of NaN scores masked to -inf before softmax
+            (> 0 flags upstream poisoning of Q/K).
+        all_neginf_rows: Bool tensor from the all-(-inf)-row guard; the row
+            count is evaluated lazily, only when a warning fires.
+
+    Returns:
+        The tensor with NaN entries replaced by 0 (unchanged if clean).
     """
-    if torch.isnan(tensor).any():
-        nan_count = torch.isnan(tensor).sum().item()
-        raise RuntimeError(f"NaN detected in {name}: {nan_count} NaN values found")
+    n_nan = int(torch.isnan(tensor).sum())
+    if n_nan == 0 and n_nan_scores == 0:
+        return tensor
+
+    n_masked_rows = int(all_neginf_rows.sum()) if all_neginf_rows is not None else 0
+    msg = (
+        f"NaN guard in {name} (layer={layer_name}): {n_nan} NaN attention "
+        f"entries replaced by 0 ({n_nan / tensor.numel():.2%} of "
+        f"{tensor.numel()}); {n_nan_scores} NaN scores masked to -inf before "
+        f"softmax; {n_masked_rows} all-masked rows zeroed. Likely causes: "
+        "(a) non-finite weights from a previous bad update (upstream "
+        "poisoning - check earlier non-finite warnings), (b) masking removed "
+        "every key of a query row, (c) score overflow. Training continues; "
+        f"set {_NAN_GUARD_ENV_VAR}=raise to crash on this event instead."
+    )
+    if os.environ.get(_NAN_GUARD_ENV_VAR, "warn").lower() == "raise":
+        raise RuntimeError(msg)
+    if _nan_warn_state["count"] < _NAN_WARN_MAX:
+        _nan_warn_state["count"] += 1
+        warnings.warn(msg, RuntimeWarning)
+        if _nan_warn_state["count"] == _NAN_WARN_MAX:
+            warnings.warn(
+                "NaN guard: warning rate limit reached; further events are "
+                "suppressed from the log.", RuntimeWarning)
+    return torch.nan_to_num(tensor, nan=0.0)
     
 if __name__ == "__main__":
     main()

@@ -23,6 +23,7 @@ import math
 import random
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pytorch_lightning as pl
 import torchmetrics as tm
 
@@ -33,9 +34,15 @@ from proT.training.losses import (
     GaussianNLL,
     LogNormalNLL,
     CensoredLogNormalNLL,
+    StudentTNLL,
+    CensoredLaplaceNLL,
+    lognormal_crps,
+    gaussian_crps,
 )
 from proT.training.sample_weights import AdaptiveLossWeighter, summarize_target
+from proT.training.hard_mining import HardMiningState
 from proT.training.qk_schedule import configure_adamw_with_qk_ramp
+from proT.training.curriculum import ForcingCurriculum
 
 
 class EncoderForecaster(pl.LightningModule):
@@ -70,6 +77,11 @@ class EncoderForecaster(pl.LightningModule):
             - training.show_trg_random_draw: if True (default), draw the threshold
               uniformly in [0, current bound] each epoch; if False, use the bound
               directly (scheduled mode)
+            - training.show_trg_units: "index" (default) or "fraction". In
+              "fraction" mode all show_trg bounds above are floats in [0, 1]
+              interpreted as a fraction of each sample's own valid (non-NaN)
+              target length, so short sequences (e.g. early IST failure) get
+              the same fraction revealed as full-length ones.
 
     Note:
         In "scheduled" mode, validation and test are always evaluated without
@@ -97,6 +109,8 @@ class EncoderForecaster(pl.LightningModule):
                 scheme=config["training"].get("loss_pos_weight", "none"),
                 alpha=config["training"].get("loss_pos_weight_alpha", 2.0),
                 bce_on_observed=config["training"].get("loss_bce_on_observed", False),
+                var_reg=config["training"].get("loss_var_reg", 0.0),
+                var_reg_form=config["training"].get("loss_var_reg_form", "raw_sigma"),
             )
         elif config["training"]["loss_fn"] == "gaussian":
             assert config["model"]["kwargs"].get("out_dim") == 2, \
@@ -105,6 +119,7 @@ class EncoderForecaster(pl.LightningModule):
                 scheme=config["training"].get("loss_pos_weight", "none"),
                 alpha=config["training"].get("loss_pos_weight_alpha", 2.0),
                 var_reg=config["training"].get("loss_var_reg", 0.0),
+                var_reg_form=config["training"].get("loss_var_reg_form", "raw_sigma"),
             )
         elif config["training"]["loss_fn"] == "lognormal":
             assert config["model"]["kwargs"].get("out_dim") == 2, \
@@ -113,7 +128,11 @@ class EncoderForecaster(pl.LightningModule):
                 scheme=config["training"].get("loss_pos_weight", "none"),
                 alpha=config["training"].get("loss_pos_weight_alpha", 2.0),
                 var_reg=config["training"].get("loss_var_reg", 0.0),
+                var_reg_form=config["training"].get("loss_var_reg_form", "raw_sigma"),
                 shift=config["training"].get("loss_log_shift", 1e-3),
+                nll_beta=config["training"].get("loss_nll_beta", 0.0),
+                var_reg_weighted=config["training"].get("loss_var_reg_weighted", False),
+                sw_mean_only=config["training"].get("loss_sw_mean_only", False),
             )
         elif config["training"]["loss_fn"] == "lognormal_censored":
             assert config["model"]["kwargs"].get("out_dim") == 2, \
@@ -123,6 +142,35 @@ class EncoderForecaster(pl.LightningModule):
                 scheme=config["training"].get("loss_pos_weight", "none"),
                 alpha=config["training"].get("loss_pos_weight_alpha", 2.0),
                 bce_on_observed=config["training"].get("loss_bce_on_observed", False),
+                var_reg=config["training"].get("loss_var_reg", 0.0),
+                var_reg_form=config["training"].get("loss_var_reg_form", "raw_sigma"),
+                shift=config["training"].get("loss_log_shift", 1e-3),
+                var_reg_weighted=config["training"].get("loss_var_reg_weighted", False),
+                expected_len=config["training"].get("loss_expected_len", None),
+                fail_margin=config["training"].get("loss_fail_margin", 0.8),
+                fail_anchor=config["training"].get("loss_fail_anchor", 0.0),
+            )
+        elif config["training"]["loss_fn"] == "student":
+            assert config["model"]["kwargs"].get("out_dim") == 2, \
+                "student loss requires out_dim=2 (channels: mu, raw_sigma)"
+            self.loss_fn = StudentTNLL(
+                scheme=config["training"].get("loss_pos_weight", "none"),
+                alpha=config["training"].get("loss_pos_weight_alpha", 2.0),
+                var_reg=config["training"].get("loss_var_reg", 0.0),
+                var_reg_form=config["training"].get("loss_var_reg_form", "raw_sigma"),
+                shift=config["training"].get("loss_log_shift", 1e-3),
+                df=config["training"].get("loss_student_df", 4.0),
+            )
+        elif config["training"]["loss_fn"] == "laplace_censored":
+            assert config["model"]["kwargs"].get("out_dim") == 2, \
+                "laplace_censored loss requires out_dim=2 (channels: mu, raw_sigma)"
+            self.loss_fn = CensoredLaplaceNLL(
+                threshold=config["training"].get("loss_censor_threshold", 1.0),
+                scheme=config["training"].get("loss_pos_weight", "none"),
+                alpha=config["training"].get("loss_pos_weight_alpha", 2.0),
+                bce_on_observed=config["training"].get("loss_bce_on_observed", False),
+                var_reg=config["training"].get("loss_var_reg", 0.0),
+                var_reg_form=config["training"].get("loss_var_reg_form", "raw_sigma"),
                 shift=config["training"].get("loss_log_shift", 1e-3),
             )
         else:
@@ -130,14 +178,64 @@ class EncoderForecaster(pl.LightningModule):
 
         # Flag for the censored-likelihood mode (derived mask, no BCE head)
         self.censored_loss = config["training"]["loss_fn"] in (
-            "gaussian_censored", "lognormal_censored"
+            "gaussian_censored", "lognormal_censored", "laplace_censored"
         )
         # Flag for log-space losses: mu parameterizes log(y + shift), so the
         # point prediction in y-space is the median exp(mu) - shift
         self.log_space_loss = config["training"]["loss_fn"] in (
-            "lognormal", "lognormal_censored"
+            "lognormal", "lognormal_censored", "student", "laplace_censored"
         )
         self.log_shift = config["training"].get("loss_log_shift", 1e-3)
+        # GRU heads: the autoregressive feedback must live in y-space, so the
+        # model converts mu -> exp(mu) - shift when a log-space loss is used
+        # (identity otherwise). See ProTEncoder._feedback_value.
+        self.model.feedback_shift = self.log_shift if self.log_space_loss else None
+
+        # Delta (incremental) output mode: the GRU head outputs per-step
+        # increments in the native loss space, accumulated in-graph to the
+        # cumulative distribution (see ProTEncoder). The main loss applies to
+        # the cumulative channels; an additional Gaussian NLL supervises the
+        # increments directly onto the decomposed target (see
+        # _increment_targets). Only likelihoods whose increments sum in
+        # closed form are supported (Gaussian/lognormal; not student/laplace).
+        # input token dropout (train only, see _step); 0 = disabled
+        self.input_token_dropout = float(
+            config["training"].get("input_token_dropout", 0.0) or 0.0)
+        self.enc_val_idx = int(config["data"]["features"]["X"]["value"])
+
+        self.delta_mode = getattr(self.model, "rnn_output_mode", "absolute") == "delta"
+        if self.delta_mode:
+            assert self.model.head_type in ("gru", "gru_per_var"), \
+                "rnn_output_mode='delta' requires a GRU head"
+            assert config["training"]["loss_fn"] in (
+                "gaussian", "gaussian_censored", "lognormal", "lognormal_censored"
+            ), "rnn_output_mode='delta' supports only gaussian/lognormal losses " \
+               "(increments must sum in closed form)"
+            self.model.sigma_eps = getattr(self.loss_fn, "eps", 1e-3)
+            self.delta_loss_fn = GaussianNLL(
+                scheme="none", eps=getattr(self.loss_fn, "eps", 1e-3))
+            self.delta_weight = config["training"].get("loss_delta_weight", 1.0)
+
+        # Absorbing "failed" state (gru_per_var, eval only): give the model the
+        # failure threshold and the y/log-space convention. See
+        # ProTEncoder._apply_fail_stop.
+        if getattr(self.model, "rnn_absorbing_fail", False):
+            self.model.fail_threshold = config["training"].get(
+                "loss_censor_threshold", 1.0)
+            self.model.fail_shift = self.log_shift if self.log_space_loss else None
+
+        # Autoregressive runaway guard (train + eval): clamp the GRU feedback
+        # value at 1.5x the censor threshold (y-space). Deliberately
+        # INDEPENDENT of the eval-only fail_threshold above: _step disables
+        # fail_threshold during training, and coupling the clamp to it left
+        # the guard off in training (root cause of the NaN cascade of run
+        # 16140288). Censored losses only - they define a meaningful y-space
+        # threshold.
+        if config["training"]["loss_fn"] in (
+                "gaussian_censored", "lognormal_censored", "laplace_censored") \
+                and hasattr(self.model, "feedback_clamp_max"):
+            self.model.feedback_clamp_max = 1.5 * config["training"].get(
+                "loss_censor_threshold", 1.0)
 
         # Adaptive sample weighting (training only; val/test stay unweighted
         # so metrics remain comparable across loss variants)
@@ -158,6 +256,10 @@ class EncoderForecaster(pl.LightningModule):
         self.tail_quantile = config["training"].get("loss_sw_tail_quantile", 0.95)
         self._tail_threshold = None
 
+        # Hard-example mining: shared per-sample loss memory, injected per fold
+        # by trainer.py (None = disabled). See proT/training/hard_mining.py.
+        self.hard_mining_state: Optional[HardMiningState] = None
+
         # Loss weights
         self.lam = config["training"].get("lam", 1.0)
         self.gamma = config["training"].get("gamma", 0.1)
@@ -166,36 +268,24 @@ class EncoderForecaster(pl.LightningModule):
         # Data indices
         self.dec_val_idx = config["data"]["val_idx"]
         self.dec_pos_idx = config["data"]["pos_idx"]
+        # variable channel in Y (gru_per_var head; needed by the fail-mode loss)
+        self.dec_var_idx = config["model"]["kwargs"].get("dec_var_idx", None)
 
-        # Online target configuration
-        self.target_show_mode = config["training"].get("target_show_mode", None)
-        self.epoch_show_trg = config["training"].get("epoch_show_trg", 0)
-        self.show_trg_max_idx = config["training"].get("show_trg_max_idx", None)
-        self.show_trg_max_idx_upper_bound = config["training"].get("show_trg_upper_bound_max", None)
-
-        # Scheduled mode configuration (annealed forcing bound)
-        self.max_epochs = config["training"]["max_epochs"]
-        self.show_trg_max_idx_start = config["training"].get("show_trg_max_idx_start", None)
-        self.show_trg_max_idx_end = config["training"].get("show_trg_max_idx_end", 0)
-        self.show_trg_schedule = config["training"].get("show_trg_schedule", "linear")
-        self.show_trg_schedule_end_frac = config["training"].get("show_trg_schedule_end_frac", 1.0)
-        self.show_trg_random_draw = config["training"].get("show_trg_random_draw", True)
-
-        # Validation
-        if self.target_show_mode == "random":
-            assert self.show_trg_max_idx_upper_bound is not None, \
-                "show_trg_upper_bound_max must be set for random target mode"
-
-        if self.target_show_mode == "scheduled":
-            assert self.show_trg_max_idx_start is not None, \
-                "show_trg_max_idx_start must be set for scheduled target mode"
-            assert self.show_trg_schedule in ("linear", "cosine"), \
-                f"show_trg_schedule must be 'linear' or 'cosine', got {self.show_trg_schedule}"
-            assert 0.0 < self.show_trg_schedule_end_frac <= 1.0, \
-                f"show_trg_schedule_end_frac must be in (0, 1], got {self.show_trg_schedule_end_frac}"
+        # Online target configuration: the whole teacher-forcing curriculum
+        # (schedule, warmup, random draw, units, validation) lives in
+        # proT/training/curriculum.py - one unit-testable place.
+        self.curriculum = ForcingCurriculum.from_config(config)
+        # synced copies used by forward()/_build_trg_pos_mask()/training_step
+        self.target_show_mode = self.curriculum.mode
+        self.epoch_show_trg = self.curriculum.epoch_show_trg
+        self.show_trg_max_idx = self.curriculum.show_trg_max_idx
+        self.show_trg_max_idx_upper_bound = self.curriculum.upper_bound_max
+        self.show_trg_units = self.curriculum.units
 
         # State tracking
         self.show_trg_active = False
+        # rate limiter for the non-finite gradient warning (on_after_backward)
+        self._nonfinite_grad_warns = 0
 
         # Save hyperparameters
         self.save_hyperparameters(config)
@@ -220,7 +310,8 @@ class EncoderForecaster(pl.LightningModule):
             data_input: Encoder input tensor (B, L_enc, D_enc)
             data_trg: Target tensor (B, L_dec, D_dec) for the GRU head;
                 ignored by the scalar head (may be None).
-            show_trg_max_idx: Maximum position index to reveal
+            show_trg_max_idx: Maximum position index to reveal (or fraction of
+                each sample's valid length when show_trg_units="fraction")
             predict_mode: If True, use show_trg_max_idx from config
 
         Returns:
@@ -251,8 +342,8 @@ class EncoderForecaster(pl.LightningModule):
 
         # Create mask for target positions
         if show_trg_max_idx is not None and show_trg_max_idx > 0:
-            # Mask along sequence dimension based on position
-            trg_pos_mask = (dec_input[:, :, self.dec_pos_idx] > show_trg_max_idx).unsqueeze(-1)
+            # Mask along sequence dimension (index or per-sample fraction mode)
+            trg_pos_mask = self._build_trg_pos_mask(dec_input, show_trg_max_idx)
 
             # Create feature mask - only zero out value feature
             feature_mask = torch.zeros(dec_input.size(-1), dtype=torch.bool, device=dec_input.device)
@@ -289,6 +380,39 @@ class EncoderForecaster(pl.LightningModule):
         return model_output, recon_output, (enc_self_att, [], pool_att), enc_mask, \
             (enc_self_ent, [], [])
 
+    def _increment_targets(self, Y: torch.Tensor) -> torch.Tensor:
+        """Decompose the absolute target into increments (delta mode).
+
+        The increment target is d_t = z_t - z_{t-1} in the native loss space
+        (z = log(y + shift) for log-space losses, z = y otherwise). The base
+        z_{-1} is the native-space value of y = 0: log(shift) in log-space
+        (was 0, which in log-space corresponds to y ~ 1 and made the first
+        increment of every curve ~ -6.9, unmatchable for a monotone head),
+        0 in y-space. For the gru_per_var head the previous position is taken
+        within the same variable only (base z_0 at each variable's first
+        position), mirroring the per-variable rollout state. NaN propagates:
+        censored/missing positions (and increments across a missing previous
+        value) are excluded by the NLL.
+        """
+        y = Y[:, :, self.dec_val_idx]                                # (B, L)
+        # the clamp is a numerical last resort: the data can dip slightly
+        # below -shift
+        if self.log_space_loss:
+            z = torch.log((y + self.log_shift).clamp_min(1e-8))
+            z0 = math.log(self.log_shift)
+        else:
+            z = y
+            z0 = 0.0
+        base = torch.full_like(z, z0)
+        base[:, 1:] = z[:, :-1]
+        if self.model.head_type == "gru_per_var":
+            var_ids = Y[:, :, self.dec_var_idx]
+            # NaN != NaN, so padded tails get base z0 (excluded via NaN z anyway)
+            same_var = var_ids[:, 1:] == var_ids[:, :-1]
+            base[:, 1:] = torch.where(same_var, z[:, :-1],
+                                      torch.full_like(z[:, 1:], z0))
+        return z - base
+
     def _step(self, batch, stage: str = None):
         # type: (tuple, Optional[str]) -> tuple
         """
@@ -301,7 +425,24 @@ class EncoderForecaster(pl.LightningModule):
         Returns:
             Tuple of (loss, predicted_values, target_data)
         """
-        X, Y = batch
+        # With hard-example mining the train loader yields (X, Y, sample_idx)
+        if len(batch) == 3:
+            X, Y, sample_idx = batch
+        else:
+            X, Y = batch
+            sample_idx = None
+        # Input token dropout (train only, anti-memorization): hide a random
+        # fraction of the OBSERVED encoder values by setting them to NaN; the
+        # existing "value_missing" embedding treats them as missing. The
+        # process/step/variable ids stay, so the model knows WHAT is hidden.
+        # A fresh subset per step breaks exact input fingerprints.
+        if stage == "train" and self.input_token_dropout > 0:
+            obs = ~torch.isnan(X[:, :, self.enc_val_idx])
+            drop = obs & (torch.rand_like(X[:, :, self.enc_val_idx])
+                          < self.input_token_dropout)
+            X = X.clone()
+            X[:, :, self.enc_val_idx] = X[:, :, self.enc_val_idx] \
+                .masked_fill(drop, float("nan"))
         trg_val = Y[:, :, self.dec_val_idx]
         trg_nan = trg_val.isnan()
         mse_mask = None
@@ -309,14 +450,36 @@ class EncoderForecaster(pl.LightningModule):
         # Forward pass. In scheduled mode, val/test are always evaluated without
         # teacher forcing (the real prediction task), so metrics are comparable
         # across epochs and best-checkpoint selection is unbiased.
-        if stage in ("val", "test") and self.target_show_mode == "scheduled":
-            forecast_output, _, _, _, (enc_self_ent, _, _) = self.forward(
-                data_input=X, data_trg=Y, show_trg_max_idx=0.0
-            )
-        else:
-            forecast_output, _, _, _, (enc_self_ent, _, _) = self.forward(
-                data_input=X, data_trg=Y
-            )
+        # The absorbing fail-stop override is disabled inside _step: the NLL
+        # must score the underlying predictive distribution, not the hard stop
+        # decision (a false-positive crossing would zero an observed tail with
+        # sigma -> 0 and explode the val/test NLL). The override stays active
+        # for prediction/reporting (proT.evaluation.predict calls forward
+        # directly).
+        _ft = getattr(self.model, "fail_threshold", None)
+        if _ft is not None:
+            self.model.fail_threshold = None
+        try:
+            if stage in ("val", "test") and self.target_show_mode == "scheduled":
+                forecast_output, _, _, _, (enc_self_ent, _, _) = self.forward(
+                    data_input=X, data_trg=Y, show_trg_max_idx=0.0
+                )
+            else:
+                forecast_output, _, _, _, (enc_self_ent, _, _) = self.forward(
+                    data_input=X, data_trg=Y
+                )
+        finally:
+            if _ft is not None:
+                self.model.fail_threshold = _ft
+
+        # Runaway diagnostic: count non-finite model outputs. A non-finite
+        # forecast no longer reaches the weights (loss-side nan_to_num +
+        # on_after_backward gradient zeroing), but it must stay visible in
+        # the logs instead of passing silently.
+        if stage == "train":
+            self.log("train_nonfinite_out",
+                     (~torch.isfinite(forecast_output)).sum().float(),
+                     on_step=False, on_epoch=True)
 
         # Entropy statistics (encoder only)
         enc_self = torch.concat(enc_self_ent, dim=0).mean()
@@ -331,19 +494,45 @@ class EncoderForecaster(pl.LightningModule):
         if self.show_trg_max_idx is not None:
             mse_mask = torch.logical_not(trg_nan)
 
-        # Gaussian / lognormal NLL (scalar head): channels are (mu, raw_sigma)
-        if self.config["training"]["loss_fn"] in ("gaussian", "lognormal"):
+        # (mu, raw_sigma, target) of the predictive distribution, set by the
+        # probabilistic branches below and consumed by the CRPS logging
+        crps_params = None
+        # base (main-loss) NLL WITHOUT the delta increment term, set by the
+        # delta-mode branches below: {stage}_nll must reflect the fit quality
+        # of the cumulative distribution only, so it stays usable for
+        # best-checkpoint selection even if the increment NLL explodes
+        nll_metric = None
+
+        # Gaussian / lognormal / student NLL: channels are (mu, raw_sigma)
+        if self.config["training"]["loss_fn"] in ("gaussian", "lognormal", "student"):
             mu = forecast_output[:, :, 0]
             raw_sigma = forecast_output[:, :, 1]
-            # trg_val is (B, L_dec) with the scalar targets in the first
-            # output_dim columns; reshape to (B, D) for the loss
-            trg_scalar = trg_val[:, :self.model.output_dim]
-            sw = self._train_sample_weights(stage, mu, raw_sigma, trg_scalar)
+            # scalar head: trg_val is (B, L_dec) with the scalar targets in
+            # the first output_dim columns -> (B, D). GRU heads predict the
+            # full target sequence: keep all positions (NaN = missing,
+            # excluded by the loss).
+            if self.model.head_type == "scalar":
+                trg_scalar = trg_val[:, :self.model.output_dim]
+            else:
+                trg_scalar = trg_val
+            sw = self._train_sample_weights(stage, mu, raw_sigma, trg_scalar,
+                                            sample_idx=sample_idx)
             loss = self.loss_fn(mu, raw_sigma, trg_scalar, sample_weight=sw)
+            # delta mode: supervise the increments on the decomposed target
+            if self.delta_mode:
+                nll_metric = loss
+                d = self.model.last_step_deltas
+                inc_nll = self.delta_loss_fn(d[:, :, 0], d[:, :, 1],
+                                             self._increment_targets(Y))
+                self.log(f"{stage}_inc_nll", inc_nll, on_step=False,
+                         on_epoch=True)
+                loss = loss + self.delta_weight * inc_nll
             # log-space losses: report the median in y-space as point forecast
             predicted_value = torch.exp(mu) - self.log_shift if self.log_space_loss else mu
             trg = torch.nan_to_num(trg_scalar)
             mse_mask = torch.logical_not(torch.isnan(trg_scalar))
+            # keep the predictive distribution for the CRPS diagnostic
+            crps_params = (mu, raw_sigma, trg_scalar)
         # Censored NLL: channels are (mu, raw_sigma), the failure mask
         # is derived from the value distribution (no independent BCE head)
         elif self.censored_loss:
@@ -357,15 +546,98 @@ class EncoderForecaster(pl.LightningModule):
                 # trg_val is (B, L_dec) with the scalar targets in the first
                 # output_dim columns; reshape to (B, D) for the loss
                 trg_scalar = trg_val[:, :self.model.output_dim]
-                sw = self._train_sample_weights(stage, mu, raw_sigma, trg_scalar)
+                sw = self._train_sample_weights(stage, mu, raw_sigma, trg_scalar,
+                                                sample_idx=sample_idx)
                 loss = self.loss_fn(mu, raw_sigma, trg_scalar, sample_weight=sw)
                 predicted_value = point
                 trg = torch.nan_to_num(trg_scalar)
                 mse_mask = torch.logical_not(torch.isnan(trg_scalar))
+                crps_params = (mu, raw_sigma, trg_scalar)
             else:
-                sw = self._train_sample_weights(stage, mu, raw_sigma, trg_val)
-                loss = self.loss_fn(mu, raw_sigma, trg_val, sample_weight=sw)
+                # fail mode: termination-aware masks (anchor + boundary
+                # survival, interrupted/early tails masked). See
+                # CensoredLogNormalNLL.classify_termination.
+                masks = None
+                if getattr(self.loss_fn, "fail_mode", False):
+                    masks = self.loss_fn.classify_termination(
+                        trg_val, Y[:, :, self.dec_var_idx], Y[:, :, self.dec_pos_idx],
+                        self.loss_fn.expected_len, self.loss_fn.threshold,
+                        self.loss_fn.fail_margin)
+                    # fail-mode diagnostics: classification balance per
+                    # variable sequence (sample, variable) and tail
+                    # supervision volume (visible in metrics.csv)
+                    self.log(f"{stage}_fail_honest_frac",
+                             masks["honest"].nanmean(), on_step=False,
+                             on_epoch=True)
+                    self.log(f"{stage}_fail_interrupted_frac",
+                             masks["interrupted"].nanmean(), on_step=False,
+                             on_epoch=True)
+                    self.log(f"{stage}_fail_survival_pos",
+                             masks["survival"].float().sum(dim=1).mean(),
+                             on_step=False, on_epoch=True)
+                sw = self._train_sample_weights(stage, mu, raw_sigma, trg_val,
+                                                sample_idx=sample_idx, masks=masks)
+                # masks are supported only by the fail-mode censored losses
+                if masks is not None:
+                    loss = self.loss_fn(mu, raw_sigma, trg_val,
+                                        sample_weight=sw, masks=masks)
+                else:
+                    loss = self.loss_fn(mu, raw_sigma, trg_val,
+                                        sample_weight=sw)
+                # delta mode: supervise the increments on the decomposed target
+                if self.delta_mode:
+                    nll_metric = loss
+                    d = self.model.last_step_deltas
+                    inc_nll = self.delta_loss_fn(d[:, :, 0], d[:, :, 1],
+                                                 self._increment_targets(Y))
+                    self.log(f"{stage}_inc_nll", inc_nll, on_step=False,
+                             on_epoch=True)
+                    loss = loss + self.delta_weight * inc_nll
                 predicted_value = point
+                # decision-consistent metrics at eval: report the point
+                # forecast of the STOPPED sequence (the deployed predictor:
+                # absorbing fail-stop + zeros), while the NLL above stays on
+                # the raw predictive distribution
+                if stage in ("val", "test") and _ft is not None:
+                    stopped = self.model._apply_fail_stop(forecast_output, Y)
+                    mu_s = stopped[:, :, 0]
+                    predicted_value = torch.exp(mu_s) - self.log_shift \
+                        if self.log_space_loss else mu_s
+                    # fail-stop diagnostics per variable sequence (sample,
+                    # variable): fraction stopped by the absorbing "failed"
+                    # state (mass-FAILED shows up as -> 1), stopped length
+                    # fraction, and predicted-failure vs honest-failure
+                    # confusion counts (stopped <=> median crossed)
+                    dead_pos = stopped[:, :, 0] != forecast_output[:, :, 0]
+                    var_y = torch.nan_to_num(Y[:, :, self.dec_var_idx], nan=0.0).long()
+                    valid_y = ~torch.isnan(Y[:, :, self.dec_pos_idx]) & (var_y > 0)
+                    n_seq, n_stop, len_frac = 0, 0, []
+                    tp = fp = fn = 0
+                    for j, v in enumerate(sorted(
+                            int(u) for u in torch.unique(var_y[valid_y]).tolist())):
+                        m_v = valid_y & (var_y == v)
+                        has_v = m_v.any(dim=1)
+                        stop_v = (dead_pos & m_v).any(dim=1) & has_v
+                        n_seq += int(has_v.sum())
+                        n_stop += int(stop_v.sum())
+                        len_frac.append(((dead_pos & m_v).sum(dim=1).float()
+                                         / m_v.sum(dim=1).clamp_min(1))[has_v])
+                        if masks is not None and j < masks["honest"].shape[1]:
+                            hon = masks["honest"][:, j] == 1.0
+                            tp += int((stop_v & hon).sum())
+                            fp += int((stop_v & ~hon).sum())
+                            fn += int((~stop_v & hon & has_v).sum())
+                    self.log(f"{stage}_failstop_frac", n_stop / max(n_seq, 1),
+                             on_step=False, on_epoch=True)
+                    self.log(f"{stage}_failstop_len_frac",
+                             torch.cat(len_frac).mean() if len_frac
+                             else torch.tensor(0.0),
+                             on_step=False, on_epoch=True)
+                    if masks is not None:
+                        for name, val in (("tp", tp), ("fp", fp), ("fn", fn)):
+                            self.log(f"{stage}_failstop_{name}", float(val),
+                                     on_step=False, on_epoch=True,
+                                     reduce_fx="sum")
                 trg = torch.nan_to_num(trg_val)
                 # metrics on observed (non-censored) positions only
                 mse_mask = torch.logical_not(trg_nan)
@@ -378,7 +650,8 @@ class EncoderForecaster(pl.LightningModule):
             bce = bce_loss_fn(Y2_hat, trg_nan.float())
 
             # only valid, non-NaN targets contribute; optional position weighting
-            sw = self._train_sample_weights(stage, Y1_hat, trg_val)
+            sw = self._train_sample_weights(stage, Y1_hat, trg_val,
+                                            sample_idx=sample_idx)
             mse = self.loss_fn(Y1_hat, trg_val, sample_weight=sw)
 
             loss = mse + self.lam * bce
@@ -389,24 +662,51 @@ class EncoderForecaster(pl.LightningModule):
             predicted_value = forecast_output.squeeze(-1)
             trg = torch.nan_to_num(trg_val)
 
-            sw = self._train_sample_weights(stage, predicted_value, trg_val)
+            sw = self._train_sample_weights(stage, predicted_value, trg_val,
+                                            sample_idx=sample_idx)
             loss = self.loss_fn(predicted_value, trg_val, sample_weight=sw)
 
         # Log metrics
+        # NOTE: torchmetrics R2Score (<=1.0.x) has a hardcoded atol=1e-4 on
+        # rss/tss; for O(1e-3) targets (IST slopes) both fall below it and the
+        # metric silently returns its sentinel 1.0. R2 is scale-invariant, so
+        # rescale to O(1) before evaluation. mae/rmse are unaffected.
         for name, metric in [("mae", self.mae), ("rmse", self.rmse), ("r2", self.r2)]:
             if mse_mask is not None:
-                metric_eval = metric(predicted_value[mse_mask], trg[mse_mask])
+                p_met, t_met = predicted_value[mse_mask], trg[mse_mask]
             else:
-                metric_eval = metric(predicted_value.reshape(-1), trg.reshape(-1))
+                p_met, t_met = predicted_value.reshape(-1), trg.reshape(-1)
+            if name == "r2":
+                p_met, t_met = p_met * 1e3, t_met * 1e3
+            metric_eval = metric(p_met, t_met)
 
             self.log(f"{stage}_{name}", metric_eval, on_step=False, on_epoch=True,
                     prog_bar=(stage == "val"))
 
         # Log the NLL as a metric for best-checkpoint selection (probabilistic losses)
         if self.config["training"]["loss_fn"] in (
-            "gaussian", "gaussian_censored", "lognormal", "lognormal_censored"
+            "gaussian", "gaussian_censored", "lognormal", "lognormal_censored",
+            "student", "laplace_censored"
         ):
-            self.log(f"{stage}_nll", loss, on_step=False, on_epoch=True,
+            self.log(f"{stage}_nll", nll_metric if nll_metric is not None else loss,
+                     on_step=False, on_epoch=True,
+                     prog_bar=(stage == "val"))
+
+        # Log the CRPS: a strictly proper scoring rule (like the NLL) but
+        # measured in y-units and bounded as sigma -> 0, where it reduces to
+        # the MAE. Unlike val_nll it stays monotone in fit quality when a
+        # variance penalty (loss_var_reg) shrinks sigma, which makes it the
+        # sound choice for best-checkpoint selection with these losses.
+        # See lognormal_crps() in proT/training/losses.py.
+        if crps_params is not None:
+            mu_c, raw_sigma_c, trg_c = crps_params
+            sigma_c = F.softplus(raw_sigma_c) + getattr(self.loss_fn, "eps", 1e-3)
+            with torch.no_grad():
+                if self.log_space_loss:
+                    crps = lognormal_crps(mu_c, sigma_c, trg_c, shift=self.log_shift)
+                else:
+                    crps = gaussian_crps(mu_c, sigma_c, trg_c)
+            self.log(f"{stage}_crps", crps, on_step=False, on_epoch=True,
                      prog_bar=(stage == "val"))
 
         # Log entropy statistics
@@ -422,6 +722,10 @@ class EncoderForecaster(pl.LightningModule):
 
     def on_train_start(self):
         """Compute the tail threshold on the training fold (in-memory tensors)."""
+        if self.config["training"].get("loss_hard_mining", False) \
+                and self.hard_mining_state is None:
+            print("Warning: loss_hard_mining is enabled but no HardMiningState was "
+                  "injected (trainer.py does this per fold). Hard mining is OFF.")
         dm = getattr(self.trainer, "datamodule", None)
         train_ds = getattr(dm, "train_ds", None) if dm is not None else None
         if train_ds is None or not hasattr(train_ds, "tensors"):
@@ -432,11 +736,30 @@ class EncoderForecaster(pl.LightningModule):
         if s.numel() > 0:
             self._tail_threshold = torch.quantile(s.float(), self.tail_quantile).item()
 
-    def _train_sample_weights(self, stage, *loss_args):
-        """Per-sample loss weights (B, 1) for training; None otherwise."""
-        if stage != "train" or self.adaptive_weighter is None:
+    def on_train_epoch_end(self):
+        """Advance the hard-mining epoch counter (read by the batch sampler
+        when the train dataloader is rebuilt for the next epoch)."""
+        if self.hard_mining_state is not None:
+            self.hard_mining_state.epoch = self.current_epoch + 1
+
+    def _train_sample_weights(self, stage, *loss_args, sample_idx=None, masks=None):
+        """Per-sample loss weights (B, 1) for training; None otherwise.
+
+        Also feeds the hard-mining loss memory (if active) from the per-sample
+        losses, so the batch sampler can refresh its hard pool next epoch.
+        """
+        if stage != "train":
             return None
-        per_sample = self.loss_fn.per_sample(*loss_args)
+        hm = self.hard_mining_state
+        if self.adaptive_weighter is None and (hm is None or sample_idx is None):
+            return None
+        per_sample = (self.loss_fn.per_sample(*loss_args, masks=masks)
+                      if masks is not None else self.loss_fn.per_sample(*loss_args))
+        if hm is not None and sample_idx is not None:
+            hm.update(sample_idx.detach().cpu().numpy(),
+                      per_sample.detach().cpu().numpy())
+        if self.adaptive_weighter is None:
+            return None
         w = self.adaptive_weighter(per_sample, self.current_epoch)
         self.adaptive_weighter.update(per_sample)
         self.log("train_sw_mean", w.mean(), on_step=False, on_epoch=True)
@@ -471,19 +794,56 @@ class EncoderForecaster(pl.LightningModule):
 
             # Update target upper bound if in random mode
             if self.current_epoch > self.epoch_show_trg and self.target_show_mode == "random":
-                self._update_target_upper_bound()
+                self.show_trg_max_idx = self.curriculum.draw_random_mode()
 
             # Update forcing threshold from the annealing schedule
             if self.show_trg_active and self.target_show_mode == "scheduled":
-                self._update_scheduled_bound()
+                self.show_trg_max_idx = self.curriculum.draw(self.current_epoch)
                 self.log("show_trg_max_idx", float(self.show_trg_max_idx),
                          on_step=False, on_epoch=True, prog_bar=False)
 
         # Forward step
         loss, _, _ = self._step(batch=batch, stage="train")
+        # safety net: a non-finite loss would poison AdamW (NaN grad -> NaN
+        # clip coefficient -> all weights NaN). Skip the pathological batch
+        # instead (Lightning skips the optimizer step when None is returned).
+        if not torch.isfinite(loss):
+            print(f"WARNING: non-finite train loss at epoch {self.current_epoch}, "
+                  f"batch {batch_idx}; batch skipped.")
+            return None
         self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
 
         return loss
+
+    def on_after_backward(self):
+        """Last line of defense against non-finite gradients.
+
+        Zeroes non-finite gradient ELEMENTS (not the whole step): with a
+        single NaN/Inf element the total grad norm is NaN, the clip
+        coefficient becomes NaN and AdamW writes NaN into EVERY weight (the
+        failure mode that killed run 16140288). This hook runs after backward
+        and BEFORE gradient clipping (Lightning order), so the surviving
+        finite gradients are still norm-clipped normally.
+        """
+        n_bad = 0
+        for p in self.parameters():
+            if p.grad is None:
+                continue
+            bad = ~torch.isfinite(p.grad)
+            n = int(bad.sum())
+            if n:
+                p.grad[bad] = 0.0
+                n_bad += n
+        if n_bad:
+            if self._trainer is not None:
+                self.log("train_grad_nonfinite", float(n_bad),
+                         on_step=False, on_epoch=True)
+            if self._nonfinite_grad_warns < 20:
+                self._nonfinite_grad_warns += 1
+                epoch = self._trainer.current_epoch \
+                    if self._trainer is not None else "?"
+                print(f"WARNING: {n_bad} non-finite gradient elements zeroed "
+                      f"(epoch {epoch}); metric: train_grad_nonfinite.")
 
     def validation_step(self, batch, batch_idx):
         """Validation step."""
@@ -522,44 +882,22 @@ class EncoderForecaster(pl.LightningModule):
         )
         return optimizer
 
-    def _update_target_upper_bound(self):
-        """Update target upper bound for random mode."""
-        if self.target_show_mode == "random":
-            self.show_trg_max_idx = random.randint(0, self.show_trg_max_idx_upper_bound)
-
-    def _scheduled_bound(self, epoch: int) -> int:
+    def _build_trg_pos_mask(self, dec_input: torch.Tensor, bound: float) -> torch.Tensor:
         """
-        Forcing upper bound at a given epoch under the annealing schedule.
+        Build the (B, L, 1) bool mask of target positions to hide from the GRU
+        (True = value must be predicted, not shown).
 
-        The bound stays at show_trg_max_idx_start until epoch_show_trg, then
-        anneals (linear or cosine) to show_trg_max_idx_end, reached at
-        epoch = show_trg_schedule_end_frac * max_epochs.
+        - "index" mode: hide positions with pos > bound (scalar comparison
+          against the position channel, original behavior).
+        - "fraction" mode: bound is a fraction in [0, 1] of each sample's own
+          valid (non-NaN value) length; the first round(bound * L_valid) valid
+          positions of each sample are shown. Rank-based, so it is robust to
+          any position spacing and to ragged/padded layouts. NaN tail
+          positions are never masked (they carry no value anyway).
         """
-        start_ep = self.epoch_show_trg
-        end_ep = min(
-            self.max_epochs - 1,
-            int(round(self.show_trg_schedule_end_frac * self.max_epochs))
-        )
-
-        if epoch <= start_ep:
-            return int(self.show_trg_max_idx_start)
-        if epoch >= end_ep:
-            return int(self.show_trg_max_idx_end)
-
-        frac = (epoch - start_ep) / max(1, end_ep - start_ep)
-        if self.show_trg_schedule == "cosine":
-            w = 0.5 * (1.0 + math.cos(math.pi * frac))  # 1 -> 0
-        else:  # linear
-            w = 1.0 - frac
-
-        return int(round(
-            self.show_trg_max_idx_end
-            + (self.show_trg_max_idx_start - self.show_trg_max_idx_end) * w
-        ))
-
-    def _update_scheduled_bound(self):
-        """Update the forcing threshold for scheduled mode (optionally random)."""
-        bound = self._scheduled_bound(self.current_epoch)
-        if self.show_trg_random_draw and bound > 0:
-            bound = random.randint(0, bound)
-        self.show_trg_max_idx = bound
+        if self.show_trg_units == "fraction":
+            valid = ~torch.isnan(dec_input[:, :, self.dec_val_idx])      # (B, L)
+            rank = valid.cumsum(dim=1) - 1                               # rank among valid
+            n_show = (bound * valid.sum(dim=1).float()).round().long()   # (B,)
+            return (valid & (rank >= n_show.unsqueeze(1))).unsqueeze(-1)
+        return (dec_input[:, :, self.dec_pos_idx] > bound).unsqueeze(-1)

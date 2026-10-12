@@ -48,13 +48,17 @@ err_pct_k = 100 * err_k / baseline_scale, where baseline_scale is the RMS of
 the baseline prediction for that sample (mean of squares for squared metrics).
 """
 
+import json
+import os
+from os.path import abspath, dirname, join
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -729,6 +733,42 @@ def _sequential_sensitivity_optimized(
 # Public API
 # ---------------------------------------------------------------------------
 
+def get_config_and_best_checkpoint(exp_path: str):
+    """
+    Load the experiment config and locate the best checkpoint of an Optuna run.
+
+    Args:
+        exp_path: experiment folder containing exactly one 'config*' file,
+            one 'best_trial*' file and the 'optuna' folder.
+
+    Returns:
+        (config, best_checkpoint_path)
+    """
+    config_list = [f for f in os.listdir(exp_path) if f.startswith("config")]
+    summary_list = [f for f in os.listdir(exp_path) if f.startswith("best_trial")]
+
+    if len(config_list) != 1:
+        raise ValueError(f"Expected exactly one config file, found: {config_list}")
+    if len(summary_list) != 1:
+        raise ValueError(f"Expected exactly one best_trial file, found: {summary_list}")
+
+    config = OmegaConf.load(join(exp_path, config_list[0]))
+    summary = OmegaConf.load(join(exp_path, summary_list[0]))
+
+    optuna_dir = join(exp_path, "optuna")
+    if not os.path.exists(optuna_dir):
+        raise FileNotFoundError(f"Optuna folder does not exist: {optuna_dir}")
+
+    run_dir = join(optuna_dir, f"run_{summary.trial_number}")
+    with open(join(run_dir, "kfold_summary.json")) as f:
+        kfold_summary = json.load(f)
+
+    best_fold = kfold_summary["best_fold"]["fold_number"]
+    best_checkpoint_path = join(run_dir, f"k_{best_fold}", "checkpoints", "best_checkpoint.ckpt")
+
+    return config, best_checkpoint_path
+
+
 def get_sequential_sensitivity_df(
     config: dict,
     datadir_path: Path,
@@ -814,7 +854,7 @@ def get_sequential_sensitivity_df(
     if n_most_sensitive < 1:
         raise ValueError("n_most_sensitive must be >= 1")
 
-    # Defaults from config (same convention as leave_one_out.py)
+    # Defaults from config
     if control_feat_idx is None:
         control_feat_idx = config["data"]["features"]["X"]["variable"]
     if intervention_feat_idx is None:
@@ -890,15 +930,15 @@ def get_sequential_sensitivity_df(
     return df
 
 
-if __name__ == "__main__":
-    from os.path import dirname, abspath, join
-    from omegaconf import OmegaConf
-    from proT.proj_specific.GSA.leave_one_out import get_config_and_best_checkpoint
-
-    ROOT_DIR = dirname(dirname(dirname(dirname(abspath(__file__)))))
-    datadir_path = join(ROOT_DIR, r"data/input")
-    experiment_path = join(ROOT_DIR, r"experiments/baseline_optuna/euler/baseline_proT_dyconex_sum_50908169")
-    output_path = join(ROOT_DIR, r"experiments/evaluations/sequential_sensitivity/df_seq_sens.csv")
+def main():
+    root_dir = dirname(dirname(dirname(dirname(abspath(__file__)))))
+    datadir_path = join(root_dir, "data", "input")
+    experiment_path = join(
+        root_dir, "experiments", "baseline_optuna", "euler", "baseline_proT_dyconex_sum_50908169"
+    )
+    output_path = join(
+        root_dir, "experiments", "evaluations", "sequential_sensitivity", "df_seq_sens.csv"
+    )
 
     config, checkpoint_path = get_config_and_best_checkpoint(experiment_path)
 
@@ -914,3 +954,8 @@ if __name__ == "__main__":
         chunk_size=None,  # auto
         output_path=output_path,
     )
+
+
+if __name__ == "__main__":
+    main()
+

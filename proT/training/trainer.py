@@ -30,6 +30,7 @@ from proT.training.forecasters.encoder_forecaster import EncoderForecaster
 from proT.labels import *
 from proT.baseline.baseline_pl_modules import RNNForecaster
 from proT.training.dataloader import ProcessDataModule
+from proT.training.hard_mining import HardMiningState
 from proT.training.experiment_control import update_config
 from proT.evaluation.predict import mk_quick_pred_plot
 
@@ -46,6 +47,7 @@ def trainer(
     plot_pred_check: bool=False,
     debug: bool=False,
     best: bool=True,
+    folds: list=None,
     )->pd.DataFrame:
     """
     Training function with k-fold cross-validation
@@ -63,6 +65,10 @@ def trainer(
                               checkpoint (based on val_mae) so that kfold_summary
                               and best_metrics.json are consistent. If False, use
                               final epoch weights. Defaults to True.
+        folds (list, optional): fold numbers to run (e.g. [2] for one SLURM
+                              array task). The split is deterministic, so
+                              parallel jobs see the same folds as a
+                              sequential run. None = all folds.
     
     Returns:
         pd.DataFrame: DataFrame containing metrics for each fold
@@ -138,7 +144,9 @@ def trainer(
     metrics_dict = {}
     
     # Initialize k-fold results tracker
-    kfold_tracker = KFoldResultsTracker(save_dir, k_folds)
+    kfold_tracker = KFoldResultsTracker(
+        save_dir, k_folds,
+        best_metric=config["training"].get("best_checkpoint_metric", "val_mae"))
     
     # Count trainable parameters (same for all folds, calculated once)
     temp_model = model_object(config)
@@ -150,7 +158,14 @@ def trainer(
     last_save_dir_k = None
     
     for fold, (train_local_idx, val_local_idx) in enumerate(kfold.split(train_val_idx)):
-        
+
+        # fold selection (parallel runs): same deterministic split, others skipped
+        if folds is not None and fold not in folds:
+            continue
+        # per-fold seed: results identical whether folds run sequentially
+        # or in parallel jobs
+        seed_everything(seed + fold)
+
         # re-initialize the model at any fold
         model = model_object(config)
         
@@ -175,10 +190,28 @@ def trainer(
         # For probabilistic losses (gaussian, gaussian_censored), monitor the NLL
         # instead of the MAE: the NLL accounts for the predicted uncertainty.
         best_metric = config["training"].get("best_checkpoint_metric", "val_mae")
-        # Skip the curriculum phase: metrics are not comparable to the final
-        # autoregressive performance while teacher forcing is active.
-        min_epoch = config["training"].get("epoch_show_trg", 0) + 1 \
-            if config["training"].get("target_show_mode") is not None else 0
+        # Skip ALL warmup phases: metrics are not comparable while teacher
+        # forcing is active (curriculum), and the objective itself changes
+        # when the adaptive sample weighter / hard-example mining switch on
+        # (the logged loss jumps at their start epoch). The lower bound is
+        # the max of all warmup schedules; an explicit
+        # best_checkpoint_min_epoch in the config overrides it.
+        min_epoch = max(
+            config["training"].get("epoch_show_trg", 0) + 1
+                if config["training"].get("target_show_mode") is not None else 0,
+            config["training"].get("loss_sw_start_epoch", 0)
+                if config["training"].get("loss_sample_weight") == "adaptive" else 0,
+            config["training"].get("loss_hm_start_epoch", 0)
+                if config["training"].get("loss_hard_mining", False) else 0,
+        )
+        if config["training"].get("target_show_mode") == "scheduled":
+            # scheduled curriculum: metrics are biased while any teacher forcing
+            # is active; start best-checkpoint selection only from the fully
+            # autoregressive floor (end of the annealing schedule)
+            min_epoch = max(min_epoch, int(round(
+                config["training"].get("show_trg_schedule_end_frac", 1.0)
+                * config["training"]["max_epochs"])))
+        min_epoch = config["training"].get("best_checkpoint_min_epoch", min_epoch)
         best_checkpoint_callback = BestCheckpointCallback(
             save_dir_k, monitor=best_metric, mode="min", min_epoch=min_epoch)
         data_index_tracker = DataIndexTracker(save_dir_k, fold, train_global_idx, val_global_idx, test_idx)
@@ -218,6 +251,21 @@ def trainer(
         # update ds
         dm.update_idx(train_idx=train_local_idx, val_idx=val_local_idx, test_idx=test_idx)
 
+        # Hard-example mining: shared per-sample loss memory between the batch
+        # sampler (dm) and the forecaster (model); reset for every fold.
+        # See proT/training/hard_mining.py.
+        hm_state = None
+        if config["training"].get("loss_hard_mining", False):
+            hm_state = HardMiningState(
+                n_samples=len(train_local_idx),
+                frac=config["training"].get("loss_hm_frac", 0.25),
+                pool_frac=config["training"].get("loss_hm_pool", 0.10),
+                start_epoch=config["training"].get("loss_hm_start_epoch", 0),
+                momentum=config["training"].get("loss_hm_momentum", 0.9),
+            )
+            model.hard_mining_state = hm_state
+        dm.hard_mining_state = hm_state
+
         trainer = pl.Trainer(
             callbacks=callbacks_list,
             logger=logger_csv, #[logger, logger_csv],
@@ -226,10 +274,21 @@ def trainer(
             #overfit_batches=1 if debug else 0,
             max_epochs=config["training"]["max_epochs"],
             log_every_n_steps= 1,
+            # validate every epoch: best-checkpoint selection can only pick
+            # epochs it actually sees. A sparse validation grid biases the
+            # selection towards whichever epochs happened to be evaluated.
+            check_val_every_n_epoch=config["training"].get("check_val_every_n_epoch", 1),
             deterministic=True,
+            # hard mining: rebuild the train dataloader every epoch so the
+            # batch sampler sees the updated per-sample loss memory
+            reload_dataloaders_every_n_epochs=1 if hm_state is not None else 0,
             enable_progress_bar=False if cluster else True,  # Disables the progress bar
             enable_model_summary=False if cluster else True,
             detect_anomaly=True if debug else False,
+            # gradient clipping (default 0.0 = disabled, Lightning default);
+            # protects long AR-rollout runs from gradient explosions
+            gradient_clip_val=config["training"].get("gradient_clip_val", 0.0),
+            gradient_clip_algorithm="norm",
         )
         # * other stuff we can do
         # trainer.tune() to find optimal hyperparameters

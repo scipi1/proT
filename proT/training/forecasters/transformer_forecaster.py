@@ -188,13 +188,20 @@ class TransformerForecaster(pl.LightningModule):
         
         
         # save metrics
+        # NOTE: torchmetrics R2Score (<=1.0.x) has a hardcoded atol=1e-4 on
+        # rss/tss; for O(1e-3) targets (IST slopes) both fall below it and the
+        # metric silently returns its sentinel 1.0. R2 is scale-invariant, so
+        # rescale to O(1) before evaluation. mae/rmse are unaffected.
         for name, metric in [("mae", self.mae), ("rmse", self.rmse), ("r2", self.r2)]:
-            
+
             if mse_mask is not None:
-                metric_eval = metric(predicted_value[mse_mask], trg[mse_mask])
+                p_met, t_met = predicted_value[mse_mask], trg[mse_mask]
             else:
-                metric_eval = metric(predicted_value.reshape(-1)  , trg.reshape(-1)  )    
-            
+                p_met, t_met = predicted_value.reshape(-1), trg.reshape(-1)
+            if name == "r2":
+                p_met, t_met = p_met * 1e3, t_met * 1e3
+            metric_eval = metric(p_met, t_met)
+
             self.log(f"{stage}_{name}", metric_eval, on_step=False, on_epoch=True, prog_bar=(stage == "val"))
             
         for name, value in [("enc_self_entropy", enc_self), ("dec_self_entropy", dec_self), ("dec_cross_entropy", dec_cross)]:

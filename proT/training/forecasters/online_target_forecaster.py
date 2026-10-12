@@ -16,6 +16,7 @@ from proT.training.losses import (
     PositionWeightedMSE,
     CensoredGaussianNLL,
     CensoredLogNormalNLL,
+    CensoredLaplaceNLL,
 )
 from proT.training.sample_weights import AdaptiveLossWeighter, summarize_target
 from proT.training.qk_schedule import configure_adamw_with_qk_ramp
@@ -69,6 +70,11 @@ class OnlineTargetForecaster(pl.LightningModule):
             - training.show_trg_random_draw: If True (default), draw the threshold
               uniformly in [0, current bound] each epoch; if False, use the bound
               directly (scheduled mode)
+            - training.show_trg_units: "index" (default) or "fraction". In
+              "fraction" mode all show_trg bounds above are floats in [0, 1]
+              interpreted as a fraction of each sample's own valid (non-NaN)
+              target length, so short sequences (e.g. early IST failure) get
+              the same fraction revealed as full-length ones.
 
     Note:
         In "scheduled" mode, validation and test are always evaluated without
@@ -96,6 +102,8 @@ class OnlineTargetForecaster(pl.LightningModule):
                 scheme=config["training"].get("loss_pos_weight", "none"),
                 alpha=config["training"].get("loss_pos_weight_alpha", 2.0),
                 bce_on_observed=config["training"].get("loss_bce_on_observed", False),
+                var_reg=config["training"].get("loss_var_reg", 0.0),
+                var_reg_form=config["training"].get("loss_var_reg_form", "raw_sigma"),
             )
         elif config["training"]["loss_fn"] == "lognormal_censored":
             assert config["model"]["kwargs"].get("out_dim") == 2, \
@@ -105,6 +113,21 @@ class OnlineTargetForecaster(pl.LightningModule):
                 scheme=config["training"].get("loss_pos_weight", "none"),
                 alpha=config["training"].get("loss_pos_weight_alpha", 2.0),
                 bce_on_observed=config["training"].get("loss_bce_on_observed", False),
+                var_reg=config["training"].get("loss_var_reg", 0.0),
+                var_reg_form=config["training"].get("loss_var_reg_form", "raw_sigma"),
+                shift=config["training"].get("loss_log_shift", 1e-3),
+                var_reg_weighted=config["training"].get("loss_var_reg_weighted", False),
+            )
+        elif config["training"]["loss_fn"] == "laplace_censored":
+            assert config["model"]["kwargs"].get("out_dim") == 2, \
+                "laplace_censored loss requires out_dim=2 (channels: mu, raw_sigma)"
+            self.loss_fn = CensoredLaplaceNLL(
+                threshold=config["training"].get("loss_censor_threshold", 1.0),
+                scheme=config["training"].get("loss_pos_weight", "none"),
+                alpha=config["training"].get("loss_pos_weight_alpha", 2.0),
+                bce_on_observed=config["training"].get("loss_bce_on_observed", False),
+                var_reg=config["training"].get("loss_var_reg", 0.0),
+                var_reg_form=config["training"].get("loss_var_reg_form", "raw_sigma"),
                 shift=config["training"].get("loss_log_shift", 1e-3),
             )
         else:
@@ -112,11 +135,13 @@ class OnlineTargetForecaster(pl.LightningModule):
         
         # Flag for the censored-likelihood mode (derived mask, no BCE head)
         self.censored_loss = config["training"]["loss_fn"] in (
-            "gaussian_censored", "lognormal_censored"
+            "gaussian_censored", "lognormal_censored", "laplace_censored"
         )
         # Flag for log-space losses: mu parameterizes log(y + shift), so the
         # point prediction in y-space is the median exp(mu) - shift
-        self.log_space_loss = config["training"]["loss_fn"] == "lognormal_censored"
+        self.log_space_loss = config["training"]["loss_fn"] in (
+            "lognormal_censored", "laplace_censored"
+        )
         self.log_shift = config["training"].get("loss_log_shift", 1e-3)
         
         # Adaptive sample weighting (training only; val/test stay unweighted
@@ -160,6 +185,24 @@ class OnlineTargetForecaster(pl.LightningModule):
         self.show_trg_schedule = config["training"].get("show_trg_schedule", "linear")
         self.show_trg_schedule_end_frac = config["training"].get("show_trg_schedule_end_frac", 1.0)
         self.show_trg_random_draw = config["training"].get("show_trg_random_draw", True)
+
+        # Units of the forcing bounds: absolute position index (default) or
+        # fraction of each sample's valid (non-NaN) target length
+        self.show_trg_units = config["training"].get("show_trg_units", "index")
+
+        # Validation
+        assert self.show_trg_units in ("index", "fraction"), \
+            f"show_trg_units must be 'index' or 'fraction', got {self.show_trg_units}"
+        if self.show_trg_units == "fraction":
+            for name, val in (
+                ("show_trg_max_idx", self.show_trg_max_idx),
+                ("show_trg_upper_bound_max", self.show_trg_max_idx_upper_bound),
+                ("show_trg_max_idx_start", self.show_trg_max_idx_start),
+                ("show_trg_max_idx_end", self.show_trg_max_idx_end),
+            ):
+                if val is not None:
+                    assert 0.0 <= val <= 1.0, \
+                        f"{name} must be in [0, 1] when show_trg_units='fraction', got {val}"
         
         # Validation
         if self.target_show_mode == "random":
@@ -197,7 +240,8 @@ class OnlineTargetForecaster(pl.LightningModule):
         Args:
             data_input: Encoder input tensor (B, L_enc, D_enc)
             data_trg: Decoder target tensor (B, L_dec, D_dec)
-            show_trg_max_idx: Maximum position index to reveal
+            show_trg_max_idx: Maximum position index to reveal (or fraction of
+                each sample's valid length when show_trg_units="fraction")
             predict_mode: If True, use show_trg_max_idx from config
             
         Returns:
@@ -215,8 +259,8 @@ class OnlineTargetForecaster(pl.LightningModule):
         
         # Create mask for target positions
         if show_trg_max_idx is not None and show_trg_max_idx > 0:
-            # Mask along sequence dimension based on position
-            trg_pos_mask = (dec_input[:, :, self.dec_pos_idx] > show_trg_max_idx).unsqueeze(-1)
+            # Mask along sequence dimension (index or per-sample fraction mode)
+            trg_pos_mask = self._build_trg_pos_mask(dec_input, show_trg_max_idx)
             
             # Create feature mask - only zero out value feature
             feature_mask = torch.zeros(dec_input.size(-1), dtype=torch.bool, device=dec_input.device)
@@ -334,13 +378,20 @@ class OnlineTargetForecaster(pl.LightningModule):
             loss = self.loss_fn(predicted_value, trg_val, sample_weight=sw)
         
         # Log metrics
+        # NOTE: torchmetrics R2Score (<=1.0.x) has a hardcoded atol=1e-4 on
+        # rss/tss; for O(1e-3) targets (IST slopes) both fall below it and the
+        # metric silently returns its sentinel 1.0. R2 is scale-invariant, so
+        # rescale to O(1) before evaluation. mae/rmse are unaffected.
         for name, metric in [("mae", self.mae), ("rmse", self.rmse), ("r2", self.r2)]:
             if mse_mask is not None:
-                metric_eval = metric(predicted_value[mse_mask], trg[mse_mask])
+                p_met, t_met = predicted_value[mse_mask], trg[mse_mask]
             else:
-                metric_eval = metric(predicted_value.reshape(-1), trg.reshape(-1))
-            
-            self.log(f"{stage}_{name}", metric_eval, on_step=False, on_epoch=True, 
+                p_met, t_met = predicted_value.reshape(-1), trg.reshape(-1)
+            if name == "r2":
+                p_met, t_met = p_met * 1e3, t_met * 1e3
+            metric_eval = metric(p_met, t_met)
+
+            self.log(f"{stage}_{name}", metric_eval, on_step=False, on_epoch=True,
                     prog_bar=(stage == "val"))
         
         # Log entropy statistics
@@ -455,10 +506,39 @@ class OnlineTargetForecaster(pl.LightningModule):
         )
         return optimizer
     
+    def _build_trg_pos_mask(self, dec_input: torch.Tensor, bound: float) -> torch.Tensor:
+        """
+        Build the (B, L, 1) bool mask of target positions to hide from the
+        decoder (True = value must be predicted, not shown).
+
+        - "index" mode: hide positions with pos > bound (scalar comparison
+          against the position channel, original behavior).
+        - "fraction" mode: bound is a fraction in [0, 1] of each sample's own
+          valid (non-NaN value) length; the first round(bound * L_valid) valid
+          positions of each sample are shown. Rank-based, so it is robust to
+          any position spacing and to ragged/padded layouts. NaN tail
+          positions are never masked (they carry no value anyway).
+        """
+        if self.show_trg_units == "fraction":
+            valid = ~torch.isnan(dec_input[:, :, self.dec_val_idx])      # (B, L)
+            rank = valid.cumsum(dim=1) - 1                               # rank among valid
+            n_show = (bound * valid.sum(dim=1).float()).round().long()   # (B,)
+            return (valid & (rank >= n_show.unsqueeze(1))).unsqueeze(-1)
+        return (dec_input[:, :, self.dec_pos_idx] > bound).unsqueeze(-1)
+
+    def _cast_bound(self, bound: float):
+        """Fraction mode keeps float bounds in [0, 1]; index mode rounds to int."""
+        if self.show_trg_units == "fraction":
+            return float(bound)
+        return int(round(bound))
+
     def _update_target_upper_bound(self):
         """Update target upper bound for random mode."""
         if self.target_show_mode == "random":
-            self.show_trg_max_idx = random.randint(0, self.show_trg_max_idx_upper_bound)
+            if self.show_trg_units == "fraction":
+                self.show_trg_max_idx = random.uniform(0.0, self.show_trg_max_idx_upper_bound)
+            else:
+                self.show_trg_max_idx = random.randint(0, self.show_trg_max_idx_upper_bound)
 
     def _scheduled_bound(self, epoch: int) -> int:
         """
@@ -475,9 +555,9 @@ class OnlineTargetForecaster(pl.LightningModule):
         )
 
         if epoch <= start_ep:
-            return int(self.show_trg_max_idx_start)
+            return self._cast_bound(self.show_trg_max_idx_start)
         if epoch >= end_ep:
-            return int(self.show_trg_max_idx_end)
+            return self._cast_bound(self.show_trg_max_idx_end)
 
         frac = (epoch - start_ep) / max(1, end_ep - start_ep)
         if self.show_trg_schedule == "cosine":
@@ -485,14 +565,17 @@ class OnlineTargetForecaster(pl.LightningModule):
         else:  # linear
             w = 1.0 - frac
 
-        return int(round(
+        return self._cast_bound(
             self.show_trg_max_idx_end
             + (self.show_trg_max_idx_start - self.show_trg_max_idx_end) * w
-        ))
+        )
 
     def _update_scheduled_bound(self):
         """Update the forcing threshold for scheduled mode (optionally random)."""
         bound = self._scheduled_bound(self.current_epoch)
         if self.show_trg_random_draw and bound > 0:
-            bound = random.randint(0, bound)
+            if self.show_trg_units == "fraction":
+                bound = random.uniform(0.0, bound)
+            else:
+                bound = random.randint(0, bound)
         self.show_trg_max_idx = bound

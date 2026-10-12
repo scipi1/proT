@@ -30,7 +30,10 @@ def cli():
 @click.option("--resume_checkpoint", default=None, help="Resume training from checkpoint")
 @click.option("--plot_pred_check", default=True, help="Set to True for a quick prediction plot after training")
 @click.option("--best/--no-best", default=True, help="Evaluate val/test on the best (val_mae) checkpoint instead of the final epoch")
-def train(exp_id, debug, cluster, exp_tag, scratch_path, resume_checkpoint, plot_pred_check, best):
+@click.option("--fold", "folds", type=int, multiple=True,
+              help="Run only this fold (repeatable, e.g. --fold 0 --fold 3); "
+                   "omit for all folds. Use with SLURM arrays: --fold $SLURM_ARRAY_TASK_ID")
+def train(exp_id, debug, cluster, exp_tag, scratch_path, resume_checkpoint, plot_pred_check, best, folds):
     
     # Get folders
     ROOT_DIR = dirname(dirname(abspath(__file__)))
@@ -75,10 +78,31 @@ def train(exp_id, debug, cluster, exp_tag, scratch_path, resume_checkpoint, plot
         resume_ckpt=resume_checkpoint,
         plot_pred_check=plot_pred_check,
         debug=debug,
-        best=best)
+        best=best,
+        folds=list(folds) if folds else None)
+
+
+# AGGREGATION (parallel folds)
+@click.command()
+@click.option("--exp_id", default=None, help="Experiment folder containing the config file")
+@click.option("--scratch_path", default=None, help="Run folder (overrides exp_id)")
+def aggregate(exp_id, scratch_path):
+    """Rebuild kfold_summary.json from all k_<n>/fold_result.json files."""
+    from proT.training.callbacks.training_callbacks import KFoldResultsTracker
+    ROOT_DIR = dirname(dirname(abspath(__file__)))
+    exp_dir = scratch_path if scratch_path else join(ROOT_DIR, "experiments", exp_id)
+    config, _ = find_yml_files(dir=exp_dir)
+    tracker = KFoldResultsTracker(
+        exp_dir, config["training"]["k_fold"],
+        best_metric=config["training"].get("best_checkpoint_metric", "val_mae"))
+    tracker._update_summary()
+    s = tracker.get_summary()
+    print(f"folds completed: {s.get('completed_folds', 0)}/{config['training']['k_fold']}, "
+          f"best fold: {s.get('best_fold', {}).get('fold_number')}")
 
 
 cli.add_command(train)
+cli.add_command(aggregate)
 
 if __name__ == "__main__":
     cli()
