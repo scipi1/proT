@@ -1,0 +1,102 @@
+# Encoder benchmark - shared base config (Dyconex IST slopes).
+# Shared and FIXED for all encoders: embedding (d_model, ds_embed_in),
+# head (d_head, hidden, n_out), data and training settings.
+# Only model.kwargs.encoder differs (see config/benchmark/encoders.yaml).
+# No timestamp encoding (time2vec) and no group feature.
+
+version: "BENCH_1.0.0"
+
+model:
+  model_object: "BENCH"
+
+  kwargs:
+    d_model     : 150
+    comps_embed : "summation"
+
+    ds_embed_in:
+      setting:
+        sparse_grad: False
+      modules:
+        - idx: ${data.features.X.process}
+          embed: "nn_embedding"
+          label: "process"
+          kwargs: {num_embeddings: 9, embedding_dim: "${model.kwargs.d_model}", padding_idx: 0, max_norm: 1}
+        - idx: ${data.features.X.occurrence}
+          embed: "nn_embedding"
+          label: "occurrence"
+          kwargs: {num_embeddings: 5, embedding_dim: "${model.kwargs.d_model}", padding_idx: 0, max_norm: 1}
+        - idx: ${data.features.X.step}
+          embed: "nn_embedding"
+          label: "step"
+          kwargs: {num_embeddings: 9, embedding_dim: "${model.kwargs.d_model}", padding_idx: 0, max_norm: 1}
+        - idx: ${data.features.X.variable}
+          embed: "nn_embedding"
+          label: "variable"
+          kwargs: {num_embeddings: 407, embedding_dim: "${model.kwargs.d_model}", padding_idx: 0, max_norm: 1}
+        - idx: ${data.features.X.design}
+          embed: "nn_embedding"
+          label: "design"
+          kwargs: {num_embeddings: 6, embedding_dim: "${model.kwargs.d_model}", padding_idx: 0, max_norm: 1}
+        - idx: ${data.features.X.panel_position}
+          embed: "nn_embedding"
+          label: "panel_position"
+          kwargs: {num_embeddings: 3, embedding_dim: "${model.kwargs.d_model}", padding_idx: 0, max_norm: 1}
+        - idx: ${data.features.X.value}
+          embed: "linear"
+          label: "value"
+          kwargs: {input_dim: 1, embedding_dim: "${model.kwargs.d_model}"}
+        - idx: ${data.features.X.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+        - idx: ${data.features.X.order}
+          embed: "pass"
+          label: "order"
+          kwargs: {}
+
+    encoder: null   # set per encoder
+
+    head:
+      d_head  : 64
+      hidden  : [64, 64]
+      n_out   : 2          # slope SenseA, SenseB
+      dropout : 0.0
+
+training:
+  lr                : 0.0005
+  weight_decay      : 0.0
+  batch_size        : 32
+  max_epochs        : 500
+  num_workers       : 0
+  loss_fn           : "mse"
+  gradient_clip_val : 1.0
+  k_fold            : 5
+  seed              : 42
+  save_ckpt_every_n_epochs : 1000
+  best_checkpoint_metric   : "val_mae"
+
+data:
+  dataset         : "dyconex_260701_seq2slope"
+  train_file      : "train_data.npz"
+  test_file       : "test_data.npz"
+  filename_input  : null
+  filename_target : null
+  val_idx         : ${data.features.Y.value}
+  test_ds_ixd     : null
+  max_data_size   : null
+  features:
+    X:
+      process        : 1
+      occurrence     : 2
+      step           : 3
+      variable       : 4
+      value          : 5
+      order          : 6
+      design         : 12
+      panel_position : 13
+    Y:
+      variable : 1
+      value    : 2     # slope
+
+special:
+  mode: []

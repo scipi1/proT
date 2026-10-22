@@ -1,0 +1,86 @@
+# Encoder benchmark - shared base config (Ishigami, last value).
+# Shared and FIXED for all encoders: embedding (d_model, ds_embed_in),
+# head (d_head, hidden, n_out), data and training settings.
+# Only model.kwargs.encoder differs (see config/benchmark/encoders.yaml).
+# Dataset: Y must hold the last Ishigami value in row 0 (Y[:, 0, value]).
+
+version: "BENCH_1.0.0"
+
+model:
+  model_object: "BENCH"
+
+  kwargs:
+    d_model     : 100
+    comps_embed : "summation"
+
+    ds_embed_in:
+      setting:
+        sparse_grad: False
+      modules:
+        - idx: ${data.features.X.variable}
+          embed: "nn_embedding"
+          label: "variable"
+          kwargs: {num_embeddings: 4, embedding_dim: "${model.kwargs.d_model}", padding_idx: 0, max_norm: 1}
+        - idx: ${data.features.X.position}
+          embed: "nn_embedding"
+          label: "position"
+          kwargs: {num_embeddings: 21, embedding_dim: "${model.kwargs.d_model}", padding_idx: 0, max_norm: 1}
+        - idx: ${data.features.X.value}
+          embed: "linear"
+          label: "value"
+          kwargs: {input_dim: 1, embedding_dim: "${model.kwargs.d_model}"}
+        - idx: ${data.features.X.noise}
+          embed: "linear"
+          label: "noise"
+          kwargs: {input_dim: 1, embedding_dim: "${model.kwargs.d_model}"}
+        - idx: ${data.features.X.value}
+          embed: "mask"
+          label: "value_missing"
+          kwargs: {}
+        - idx: ${data.features.X.order}
+          embed: "pass"
+          label: "order"
+          kwargs: {}
+
+    encoder: null   # set per encoder
+
+    head:
+      d_head  : 64
+      hidden  : [64, 64]
+      n_out   : 1          # last Ishigami value
+      dropout : 0.0
+
+training:
+  lr                : 0.001
+  weight_decay      : 0.0
+  batch_size        : 50
+  max_epochs        : 200
+  num_workers       : 0
+  loss_fn           : "mse"
+  gradient_clip_val : 1.0
+  k_fold            : 5
+  seed              : 42
+  save_ckpt_every_n_epochs : 1000
+  best_checkpoint_metric   : "val_mae"
+
+data:
+  dataset         : "ishigami_last_value_ds"   # to be generated (Y: last value only)
+  train_file      : "train_data.npz"
+  test_file       : "test_data.npz"
+  filename_input  : null
+  filename_target : null
+  val_idx         : ${data.features.Y.value}
+  test_ds_ixd     : null
+  max_data_size   : null
+  features:
+    X:
+      value    : 0
+      position : 1
+      noise    : 2
+      variable : 3
+      order    : 1
+    Y:
+      value    : 0
+
+special:
+  mode: []

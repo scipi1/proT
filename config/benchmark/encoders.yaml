@@ -1,0 +1,22 @@
+# Encoder benchmark - default encoder settings (starting point for Optuna).
+# Optuna samples only model.kwargs.encoder.kwargs.* and training.lr.
+
+proT_bench:
+  type: "proT_bench"
+  kwargs: {e_layers: 1, n_heads: 1, d_ff: 200, d_qk: 50, dropout: 0.1}
+
+GRU:
+  type: "GRU"
+  kwargs: {d_hidden: 128, n_layers: 2, dropout: 0.1}
+
+LSTM:
+  type: "LSTM"
+  kwargs: {d_hidden: 128, n_layers: 2, dropout: 0.1}
+
+TCN:
+  type: "TCN"
+  kwargs: {channels: [64, 64, 128], kernel: 3, dropout: 0.1}
+
+MLP:
+  type: "MLP"
+  kwargs: {hidden: [256, 256], dropout: 0.1}
