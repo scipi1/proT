@@ -207,6 +207,29 @@ class GaussianNLL(nn.Module):
 
         return loss
 
+    def components(
+        self,
+        mu: torch.Tensor,
+        raw_sigma: torch.Tensor,
+        target: torch.Tensor,
+    ) -> dict:
+        """Detached, unweighted decomposition of the NLL over valid targets.
+
+        Returns err (0.5 z^2), logsig (log sigma) and sigma quantiles. The
+        NLL equals 0.5 log(2 pi) + logsig + err (before the variance penalty).
+        """
+        with torch.no_grad():
+            sigma = F.softplus(raw_sigma) + self.eps
+            valid = ~torch.isnan(target)
+            if not valid.any():
+                return {}
+            z = (torch.nan_to_num(target) - mu) / sigma
+            s_v = sigma[valid]
+            return {"err": (0.5 * z[valid] ** 2).mean(),
+                    "logsig": torch.log(s_v).mean(),
+                    "sigma_med": s_v.median(),
+                    "sigma_p05": torch.quantile(s_v.float(), 0.05)}
+
     def per_sample(
         self,
         mu: torch.Tensor,
@@ -1004,6 +1027,16 @@ class CensoredLogNormalNLL(nn.Module):
             late ones). In fail mode the anchor positions are excluded (the
             anchor pulls them to the threshold, p_fail = 0.5). Default 1.0
             (legacy behavior).
+        sigma_y_floor: Minimum y-space standard deviation (measurement-noise
+            level, e.g. 0.005). In log-space the implied std is
+            sigma_y / (y + shift), so near y ~ 0 the log-space sigma is forced
+            to be wide; the bulk (where sigma_y > floor) is untouched. Motive:
+            with a small log shift the NLL concentrates in near-zero targets
+            whose log-space z explodes when sigma is tiny (run 17872836:
+            y <= 0.05 carried >100% of the val NLL). 0.0 = off.
+        sigma_y_floor_weight: Weight of the soft penalty
+            relu(sigma_y_floor - (y + shift) * sigma)^2, averaged over the
+            observed positions. Default 1.0.
     """
 
     def __init__(
@@ -1021,6 +1054,8 @@ class CensoredLogNormalNLL(nn.Module):
         fail_margin: float = 0.8,
         fail_anchor: float = 0.0,
         bce_weight: float = 1.0,
+        sigma_y_floor: float = 0.0,
+        sigma_y_floor_weight: float = 1.0,
     ):
         super().__init__()
         assert var_reg_form in ("raw_sigma", "sigma"), \
@@ -1042,6 +1077,9 @@ class CensoredLogNormalNLL(nn.Module):
         self.fail_margin = fail_margin
         self.fail_anchor = fail_anchor
         self.fail_mode = expected_len is not None
+        # y-space sigma floor (measurement-noise level, see class docstring)
+        self.sigma_y_floor = sigma_y_floor
+        self.sigma_y_floor_weight = sigma_y_floor_weight
         # censoring threshold in log-space
         self.log_threshold = math.log(threshold + shift)
         self._weight_cache = {}
@@ -1319,7 +1357,78 @@ class CensoredLogNormalNLL(nn.Module):
             else:
                 loss = loss + self.fail_anchor * anch.mean()
 
+        # y-space sigma floor: soft penalty, observed positions only
+        if self.sigma_y_floor > 0:
+            m_obs = masks["observed"] if masks is not None else valid
+            sig_y = (torch.nan_to_num(target) + self.shift) * sigma
+            loss = loss + self.sigma_y_floor_weight * (
+                torch.relu(self.sigma_y_floor - sig_y[m_obs]) ** 2).mean()
+
         return loss
+
+    def components(
+        self,
+        mu: torch.Tensor,
+        raw_sigma: torch.Tensor,
+        target: torch.Tensor,
+        masks: dict = None,
+    ) -> dict:
+        """Detached, UNWEIGHTED decomposition of the loss (no sample weights,
+        no hard mining), for logging. Means are per-position over each term's
+        own support:
+
+          obs_err    0.5 z^2 on observed (z = (log(y+s) - mu) / sigma)
+          obs_logsig log sigma on observed (the "variance term")
+          obs_jac    log(y+s) on observed (data constant, no gradient)
+          obs_nll    full observed NLL = 0.5 log(2 pi) + logsig + err + jac
+          surv       -log P(y >= thr) on survival (honest tail) positions
+          alive      bce_weight * -log P(y < thr) on observed non-anchor
+          var_pen    var_reg * pen on active positions
+          anchor     fail_anchor * (mu - log thr)^2 on anchor positions
+          sigma_med  median sigma on observed positions
+        """
+        with torch.no_grad():
+            sigma = F.softplus(raw_sigma) + self.eps
+            log_y = torch.log((torch.nan_to_num(target) + self.shift).clamp_min(1e-8))
+            z_obs = (log_y - mu) / sigma
+            z_thr = (mu - self.log_threshold) / sigma
+            if masks is not None:
+                obs, surv, anch = masks["observed"], masks["survival"], masks["anchor"]
+                active = masks["active"]
+            else:
+                obs = ~torch.isnan(target)
+                surv = torch.isnan(target)
+                anch = torch.zeros_like(obs)
+                active = torch.ones_like(obs)
+
+            def _m(x, m):
+                return torch.nan_to_num(x[m], posinf=1e6).mean() if m.any() \
+                    else torch.zeros((), device=x.device)
+
+            out = {"obs_err": _m(0.5 * z_obs ** 2, obs),
+                   "obs_logsig": _m(torch.log(sigma), obs),
+                   "obs_jac": _m(log_y, obs)}
+            out["obs_nll"] = 0.5 * math.log(2.0 * math.pi) + out["obs_logsig"] \
+                + out["obs_err"] + out["obs_jac"]
+            out["surv"] = _m(-torch.special.log_ndtr(z_thr), surv)
+            if self.bce_on_observed and self.bce_weight > 0:
+                out["alive"] = self.bce_weight * _m(self._neg_log_sf(z_thr),
+                                                    obs & ~anch)
+            if self.var_reg > 0:
+                pen = raw_sigma ** 2 if self.var_reg_form == "raw_sigma" else sigma ** 2
+                out["var_pen"] = self.var_reg * _m(pen, active)
+            if self.fail_anchor > 0 and anch.any():
+                out["anchor"] = self.fail_anchor * _m(
+                    (mu - self.log_threshold) ** 2, anch)
+            if self.sigma_y_floor > 0 and obs.any():
+                sig_y = (torch.exp(log_y)) * sigma  # = (y + shift) * sigma
+                out["yfloor"] = self.sigma_y_floor_weight * _m(
+                    torch.relu(self.sigma_y_floor - sig_y) ** 2, obs)
+                out["yfloor_viol_frac"] = _m(
+                    (sig_y < self.sigma_y_floor).to(sigma.dtype), obs)
+            out["sigma_med"] = sigma[obs].median() if obs.any() \
+                else torch.zeros((), device=mu.device)
+            return out
 
     def per_sample(
         self,
@@ -1352,3 +1461,62 @@ class CensoredLogNormalNLL(nn.Module):
             w = w * active.to(nll.dtype)
             denom = w.sum(dim=1).clamp_min(1e-8)
             return (nll * w).sum(dim=1) / denom
+
+
+def crossing_time_crps(
+    mu: torch.Tensor,
+    raw_sigma: torch.Tensor,
+    masks: dict,
+    log_threshold: float,
+    expected_len: int,
+    eps: float = 1e-3,
+    sample_weight: torch.Tensor = None,
+) -> torch.Tensor:
+    """
+    CRPS of the predicted failure (threshold-crossing) time, in cycles.
+
+    Motivation: the Tobit survival term and the boundary anchor supervise
+    the failure at single positions, i.e. a per-position classification. The
+    cheapest way to satisfy them is to stay low and jump to the threshold at
+    exactly t_fail (the "appended spike"). This term instead scores a
+    distance to the failure, so a gradual approach is rewarded.
+
+    Per position t the predicted failure CDF is F(t) = P(y_t >= thr)
+    = Phi((mu_t - log(thr + s)) / sigma_t). With the observed failure status
+    H(t) (0 = alive, 1 = failed) the discrete CRPS of the crossing time T is
+
+        CRPS(T) = sum_t (F(t) - H(t))^2
+
+    which grows with |predicted crossing - t_fail| (each wrong cycle costs up
+    to 1). Labels from classify_termination:
+      - observed positions (anchor excluded): H = 0 (still alive). This also
+        covers survivors and interrupted sequences (right-censored at their
+        last observed cycle), so a missed failure is never rewarded there.
+      - survival positions (honest-failure tail): H = 1.
+      - anchor (last observed point of a failure, mu pulled to the threshold
+        so F = 0.5 by design): excluded.
+    The sum runs over both variables of a sample and is divided by
+    expected_len so the term is O(1) per sample.
+
+    Args:
+        mu, raw_sigma: (B, L) log-space head outputs.
+        masks: classify_termination output (fail mode required).
+        log_threshold: log(threshold + shift).
+        expected_len: Expected sequence length (normalization).
+        eps: sigma floor, as in the NLL.
+        sample_weight: Optional (B, 1) per-sample weights.
+
+    Returns:
+        Scalar loss (weighted mean over samples with support).
+    """
+    sigma = F.softplus(raw_sigma) + eps
+    f = torch.special.ndtr((mu - log_threshold) / sigma)
+    h = masks["survival"].to(f.dtype)
+    support = (masks["observed"] & ~masks["anchor"]) | masks["survival"]
+    # select before squaring: inactive positions may carry drifted values
+    sq = torch.where(support, (f - h) ** 2, torch.zeros_like(f))
+    per_b = sq.sum(dim=1) / float(expected_len)
+    has = support.any(dim=1).to(f.dtype)
+    w = has if sample_weight is None else has * sample_weight.view(-1)
+    return (per_b * w).sum() / w.sum().clamp_min(1e-8)
+

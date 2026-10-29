@@ -20,6 +20,7 @@ from proT.training.losses import (
 )
 from proT.training.sample_weights import AdaptiveLossWeighter, summarize_target
 from proT.training.qk_schedule import configure_adamw_with_qk_ramp
+from proT.training.forecasters.target_mask import fraction_reveal_mask
 
 
 class OnlineTargetForecaster(pl.LightningModule):
@@ -513,17 +514,14 @@ class OnlineTargetForecaster(pl.LightningModule):
 
         - "index" mode: hide positions with pos > bound (scalar comparison
           against the position channel, original behavior).
-        - "fraction" mode: bound is a fraction in [0, 1] of each sample's own
-          valid (non-NaN value) length; the first round(bound * L_valid) valid
-          positions of each sample are shown. Rank-based, so it is robust to
-          any position spacing and to ragged/padded layouts. NaN tail
-          positions are never masked (they carry no value anyway).
+        - "fraction" mode: per sample and per target variable, the first
+          round(bound * L_v) valid positions are shown, L_v counting observed
+          AND censored positions (leak-free, see fraction_reveal_mask).
         """
         if self.show_trg_units == "fraction":
-            valid = ~torch.isnan(dec_input[:, :, self.dec_val_idx])      # (B, L)
-            rank = valid.cumsum(dim=1) - 1                               # rank among valid
-            n_show = (bound * valid.sum(dim=1).float()).round().long()   # (B,)
-            return (valid & (rank >= n_show.unsqueeze(1))).unsqueeze(-1)
+            return fraction_reveal_mask(
+                dec_input, bound, self.dec_pos_idx, self.dec_val_idx,
+                self.config["model"]["kwargs"].get("dec_var_idx", None))
         return (dec_input[:, :, self.dec_pos_idx] > bound).unsqueeze(-1)
 
     def _cast_bound(self, bound: float):

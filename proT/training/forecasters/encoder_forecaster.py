@@ -38,11 +38,13 @@ from proT.training.losses import (
     CensoredLaplaceNLL,
     lognormal_crps,
     gaussian_crps,
+    crossing_time_crps,
 )
 from proT.training.sample_weights import AdaptiveLossWeighter, summarize_target
 from proT.training.hard_mining import HardMiningState
 from proT.training.qk_schedule import configure_adamw_with_qk_ramp
 from proT.training.curriculum import ForcingCurriculum
+from proT.training.forecasters.target_mask import fraction_reveal_mask
 
 
 class EncoderForecaster(pl.LightningModule):
@@ -58,6 +60,10 @@ class EncoderForecaster(pl.LightningModule):
             - training.loss_bce_on_observed: optional, default False
             - training.loss_bce_weight: weight of the bce_on_observed "alive"
               term (lognormal_censored only), default 1.0
+            - training.loss_ttf_weight: weight of the crossing-time CRPS
+              (lognormal_censored fail mode only), default 0.0 = off
+            - training.loss_crps_weight: weight of the y-space CRPS added to
+              the training loss (lognormal_censored), default 0.0 = off
             - training.loss_log_shift: shift s for the lognormal losses
               (log(y + s) is modeled; must satisfy min(target) + s > 0)
             - training.lr: learning rate for AdamW
@@ -152,6 +158,9 @@ class EncoderForecaster(pl.LightningModule):
                 fail_margin=config["training"].get("loss_fail_margin", 0.8),
                 fail_anchor=config["training"].get("loss_fail_anchor", 0.0),
                 bce_weight=config["training"].get("loss_bce_weight", 1.0),
+                sigma_y_floor=config["training"].get("loss_sigma_y_floor", 0.0),
+                sigma_y_floor_weight=config["training"].get(
+                    "loss_sigma_y_floor_weight", 1.0),
             )
         elif config["training"]["loss_fn"] == "student":
             assert config["model"]["kwargs"].get("out_dim") == 2, \
@@ -178,6 +187,14 @@ class EncoderForecaster(pl.LightningModule):
             )
         else:
             raise ValueError(f"Unsupported loss function: {config['training']['loss_fn']}")
+
+        # Extra objectives (lognormal_censored): crossing-time CRPS (needs
+        # fail mode) and y-space CRPS (bounded, sigma-honest). 0 = off.
+        self.ttf_weight = float(config["training"].get("loss_ttf_weight", 0.0) or 0.0)
+        self.crps_weight = float(config["training"].get("loss_crps_weight", 0.0) or 0.0)
+        if self.ttf_weight > 0:
+            assert getattr(self.loss_fn, "fail_mode", False), \
+                "loss_ttf_weight requires lognormal_censored with loss_expected_len"
 
         # Flag for the censored-likelihood mode (derived mask, no BCE head)
         self.censored_loss = config["training"]["loss_fn"] in (
@@ -608,15 +625,61 @@ class EncoderForecaster(pl.LightningModule):
                     self.log(f"{stage}_bce",
                              self.loss_fn.bce_term(mu, raw_sigma, trg_val, masks),
                              on_step=False, on_epoch=True)
+                # unweighted loss decomposition (cum_*): which term moves
+                if hasattr(self.loss_fn, "components"):
+                    for k, v in self.loss_fn.components(
+                            mu, raw_sigma, trg_val, masks).items():
+                        self.log(f"{stage}_cum_{k}", v, on_step=False, on_epoch=True)
+                # base NLL (cumulative, incl. penalty/anchor) before the
+                # extra objectives below, for checkpoint selection
+                nll_metric = loss
+                # crossing-time CRPS (distance to failure, see losses.py)
+                if self.ttf_weight > 0 and masks is not None:
+                    ttf = crossing_time_crps(
+                        mu, raw_sigma, masks, self.loss_fn.log_threshold,
+                        self.loss_fn.expected_len, eps=self.loss_fn.eps,
+                        sample_weight=sw)
+                    self.log(f"{stage}_ttf_crps", ttf, on_step=False, on_epoch=True)
+                    loss = loss + self.ttf_weight * ttf
+                # y-space CRPS on observed positions (bounded, discourages
+                # overconfident sigma without the NLL's unbounded error term)
+                if self.crps_weight > 0 and self.log_space_loss:
+                    sig_c = F.softplus(raw_sigma) + self.loss_fn.eps
+                    trg_obs = trg_val if masks is None else torch.where(
+                        masks["observed"], trg_val, torch.full_like(trg_val, float("nan")))
+                    crps_tr = lognormal_crps(mu, sig_c, trg_obs, shift=self.log_shift)
+                    loss = loss + self.crps_weight * crps_tr
                 # delta mode: supervise the increments on the decomposed target
                 if self.delta_mode:
-                    nll_metric = loss
                     d = self.model.last_step_deltas
-                    inc_nll = self.delta_loss_fn(d[:, :, 0], d[:, :, 1],
-                                                 self._increment_targets(Y))
+                    inc_trg = self._increment_targets(Y)
+                    inc_nll = self.delta_loss_fn(d[:, :, 0], d[:, :, 1], inc_trg)
                     self.log(f"{stage}_inc_nll", inc_nll, on_step=False,
                              on_epoch=True)
+                    for k, v in self.delta_loss_fn.components(
+                            d[:, :, 0], d[:, :, 1], inc_trg).items():
+                        self.log(f"{stage}_inc_{k}", v, on_step=False, on_epoch=True)
+                    var_min = getattr(self.model, "rnn_delta_var_min", None)
+                    if var_min:
+                        # fraction of increments whose std sits within 10%
+                        # of the floor sqrt(var_min) (raw follows the
+                        # sigma = softplus(raw) + eps convention)
+                        dsig = F.softplus(d[:, :, 1]) + self.loss_fn.eps
+                        ok = ~torch.isnan(inc_trg)
+                        if ok.any():
+                            self.log(f"{stage}_inc_at_floor",
+                                     (dsig[ok] <= 1.1 * var_min ** 0.5).float().mean(),
+                                     on_step=False, on_epoch=True)
                     loss = loss + self.delta_weight * inc_nll
+                # train total without sample weights / hard mining, comparable
+                # to val_loss (detached diagnostic; val/test are unweighted)
+                if stage == "train" and sw is not None:
+                    with torch.no_grad():
+                        self.log("train_nll_unweighted",
+                                 self.loss_fn(mu, raw_sigma, trg_val, masks=masks)
+                                 if masks is not None else
+                                 self.loss_fn(mu, raw_sigma, trg_val),
+                                 on_step=False, on_epoch=True)
                 predicted_value = point
                 # decision-consistent metrics at eval: report the point
                 # forecast of the STOPPED sequence (the deployed predictor:
@@ -977,17 +1040,12 @@ class EncoderForecaster(pl.LightningModule):
 
         - "index" mode: hide positions with pos > bound (scalar comparison
           against the position channel, original behavior).
-        - "fraction" mode: bound is a fraction in [0, 1] of each sample's own
-          valid (non-NaN value) length; the first round(bound * L_valid) valid
-          positions of each sample are shown. Rank-based, so it is robust to
-          any position spacing and to ragged/padded layouts. NaN tail
-          positions are never masked (they carry no value anyway).
+        - "fraction" mode: per sample and per target variable, the first
+          round(bound * L_v) valid positions are shown, L_v counting observed
+          AND censored positions (leak-free, see fraction_reveal_mask);
+          bound may be a per-sample (B,) tensor.
         """
         if self.show_trg_units == "fraction":
-            valid = ~torch.isnan(dec_input[:, :, self.dec_val_idx])      # (B, L)
-            rank = valid.cumsum(dim=1) - 1                               # rank among valid
-            if torch.is_tensor(bound):                                   # per-sample (B,)
-                bound = bound.to(device=valid.device, dtype=torch.float32)
-            n_show = (bound * valid.sum(dim=1).float()).round().long()   # (B,)
-            return (valid & (rank >= n_show.unsqueeze(1))).unsqueeze(-1)
+            return fraction_reveal_mask(dec_input, bound, self.dec_pos_idx,
+                                        self.dec_val_idx, self.dec_var_idx)
         return (dec_input[:, :, self.dec_pos_idx] > bound).unsqueeze(-1)
