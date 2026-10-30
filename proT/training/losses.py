@@ -939,18 +939,29 @@ def lognormal_crps(
     valid = ~torch.isnan(target)
     y_s = (torch.nan_to_num(target) + shift).clamp_min(1e-12)
     log_y = torch.log(y_s)
-    w = (log_y - mu) / sigma
 
-    crps = y_s * (2.0 * torch.special.ndtr(w) - 1.0) - 2.0 * torch.exp(
-        mu + 0.5 * sigma ** 2
-    ) * (
+    # Numerical guardrail: in delta mode the cumulative sigma grows ~sqrt(L)
+    # and exp(mu + sigma^2/2) overflows float32 (arg > ~88). Clamp the INPUTS
+    # (not the exponent): the result stays the exact CRPS of a valid
+    # lognormal (>= 0), so it cannot be lowered by inflating sigma. Clamping
+    # only exp() made the score negative and rewarded sigma -> inf.
+    # Max exponent: 5 + 0.5 * 5^2 = 17.5 (finite in float32).
+    sigma = sigma.clamp(max=5.0)
+    mu = mu.clamp(max=5.0)
+    w = (log_y - mu) / sigma
+    crps = y_s * (2.0 * torch.special.ndtr(w) - 1.0) - 2.0 * torch.exp(mu + 0.5 * sigma ** 2) * (
         torch.special.ndtr(w - sigma)
         + torch.special.ndtr(sigma / math.sqrt(2.0))
         - 1.0
     )
 
+    # select valid positions BEFORE reducing (inf * 0 = NaN), then clamp
+    # pathological values as in CensoredLogNormalNLL.forward
+    crps = torch.where(valid, crps, torch.zeros_like(crps))
+    crps = torch.nan_to_num(crps, nan=0.0, posinf=1e6, neginf=-1e6)
+
     denom = valid.float().sum().clamp_min(1.0)
-    return (crps * valid.float()).sum() / denom
+    return crps.sum() / denom
 
 
 def gaussian_crps(

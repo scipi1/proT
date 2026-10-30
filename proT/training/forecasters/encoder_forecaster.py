@@ -13,6 +13,9 @@ Supports two head variants:
   per target variable; each variable's rollout starts from its own
   encoder-derived initial hidden state and no hidden state flows across
   variables. Requires model.kwargs n_dec_vars and dec_var_idx.
+- "spline_per_var": per-variable MLP -> Gaussian over I-spline coefficients
+  (no recurrence); given target positions condition the coefficients with
+  an exact Kalman update (see proT/core/spline_head.py). Same curriculum.
 
 The probabilistic losses (PositionWeightedMSE / CensoredGaussianNLL) are kept
 unchanged: the model outputs (mu, raw_sigma) channels.
@@ -236,6 +239,11 @@ class EncoderForecaster(pl.LightningModule):
                 scheme="none", eps=getattr(self.loss_fn, "eps", 1e-3))
             self.delta_weight = config["training"].get("loss_delta_weight", 1.0)
 
+        # Spline head: the predictive variance is converted to raw_sigma with
+        # the loss convention sigma = softplus(raw) + eps
+        if self.model.head_type == "spline_per_var":
+            self.model.sigma_eps = getattr(self.loss_fn, "eps", 1e-3)
+
         # Absorbing "failed" state (gru_per_var, eval only): give the model the
         # failure threshold and the y/log-space convention. See
         # ProTEncoder._apply_fail_stop.
@@ -307,8 +315,8 @@ class EncoderForecaster(pl.LightningModule):
         if self.val_cond_fracs:
             assert self.show_trg_units == "fraction", \
                 "val_cond_fracs requires show_trg_units='fraction'"
-            assert self.model.head_type in ("gru", "gru_per_var"), \
-                "val_cond_fracs requires a GRU head"
+            assert self.model.head_type in ("gru", "gru_per_var", "spline_per_var"), \
+                "val_cond_fracs requires a sequential (GRU / spline) head"
 
         # State tracking
         self.show_trg_active = False
@@ -323,7 +331,7 @@ class EncoderForecaster(pl.LightningModule):
         self.rmse = tm.MeanSquaredError(squared=False)
         self.r2 = tm.R2Score()
 
-        print(f"✓ EncoderForecaster initialized")
+        print(f"[OK] EncoderForecaster initialized")
         print(f"  - Head type: {self.model.head_type}")
         print(f"  - Target show mode: {self.target_show_mode}")
         print(f"  - Optimizer: AdamW (lr={config['training']['lr']})")
@@ -648,6 +656,9 @@ class EncoderForecaster(pl.LightningModule):
                     trg_obs = trg_val if masks is None else torch.where(
                         masks["observed"], trg_val, torch.full_like(trg_val, float("nan")))
                     crps_tr = lognormal_crps(mu, sig_c, trg_obs, shift=self.log_shift)
+                    if stage == "train":
+                        self.log("train_crps_obs", crps_tr.detach(),
+                                 on_step=False, on_epoch=True)
                     loss = loss + self.crps_weight * crps_tr
                 # delta mode: supervise the increments on the decomposed target
                 if self.delta_mode:
@@ -883,7 +894,7 @@ class EncoderForecaster(pl.LightningModule):
         """
         # The scalar head has no sequential target to reveal: the adaptive
         # curriculum is only active for the GRU heads.
-        if self.model.head_type in ("gru", "gru_per_var"):
+        if self.model.head_type in ("gru", "gru_per_var", "spline_per_var"):
             # Check if we should start showing targets
             if self.current_epoch == self.epoch_show_trg:
                 self.show_trg_active = True
@@ -915,7 +926,11 @@ class EncoderForecaster(pl.LightningModule):
         # safety net: a non-finite loss would poison AdamW (NaN grad -> NaN
         # clip coefficient -> all weights NaN). Skip the pathological batch
         # instead (Lightning skips the optimizer step when None is returned).
-        if not torch.isfinite(loss):
+        finite = bool(torch.isfinite(loss))
+        # fraction of skipped batches per epoch (makes silent skips visible)
+        self.log("train_nonfinite_loss", 0.0 if finite else 1.0,
+                 on_step=False, on_epoch=True)
+        if not finite:
             print(f"WARNING: non-finite train loss at epoch {self.current_epoch}, "
                   f"batch {batch_idx}; batch skipped.")
             return None

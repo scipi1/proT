@@ -229,7 +229,7 @@ class OnlineTargetForecaster(pl.LightningModule):
         self.rmse = tm.MeanSquaredError(squared=False)
         self.r2 = tm.R2Score()
         
-        print(f"✓ OnlineTargetForecaster initialized")
+        print(f"[OK] OnlineTargetForecaster initialized")
         print(f"  - Target show mode: {self.target_show_mode}")
         print(f"  - Optimizer: AdamW (lr={config['training']['lr']})")
     

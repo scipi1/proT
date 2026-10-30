@@ -38,7 +38,7 @@ class SimulatorForecaster(SimpleForecaster):
         self.decoder_input_module = simulator.get_decoder_input
         self.trajectory_simulator = simulator.forward
         
-        print(f"✓ SimulatorForecaster initialized with model: {simulator_model}")
+        print(f"[OK] SimulatorForecaster initialized with model: {simulator_model}")
     
     def forward(self, data_input: torch.Tensor, data_trg: torch.Tensor) -> Any:
         """

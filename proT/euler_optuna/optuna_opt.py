@@ -384,7 +384,7 @@ class OptunaStudy:
             print(f"Optimizing '{self.optimization_metric}' ({self.direction})")
             
         except DuplicatedStudyError:
-            print(f"Study '{self.study_name}' already exists — use --mode resume to continue")
+            print(f"Study '{self.study_name}' already exists - use --mode resume to continue")
             return
         
     def resume(self, storage=None):

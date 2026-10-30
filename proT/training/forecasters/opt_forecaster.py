@@ -56,7 +56,7 @@ class OptimizationForecaster(OnlineTargetForecaster):
         assert opt_mode in [1, 2, 3, 4, 5, 6, 7], \
             f"Invalid optimization mode: {opt_mode}. Must be 1-7."
         
-        print(f"✓ OptimizationForecaster initialized")
+        print(f"[OK] OptimizationForecaster initialized")
         print(f"  - Optimization mode: {opt_mode}")
         print(f"  - Manual optimization: enabled")
         print(f"  - Switch epoch: {self.switch_epoch}")
@@ -128,7 +128,7 @@ class OptimizationForecaster(OnlineTargetForecaster):
                 self.lr_schedulers()[0] = model_scheduler_switch
             
             self._switched = True
-            print(f"✓ Switched to phase 2 optimizers at epoch {self.current_epoch}")
+            print(f"[OK] Switched to phase 2 optimizers at epoch {self.current_epoch}")
         
         # Optimizer steps
         opt_emb_now.step()

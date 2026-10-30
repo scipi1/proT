@@ -15,6 +15,7 @@ from .modules.encoder import Encoder, EncoderLayer
 from .modules.extra_layers import Normalization, UniformAttentionMask
 from .modules.gru_ops import gru_cell, stack_gru_params, hidden_gates
 from .innovation_update import InnovationUpdate
+from .spline_head import SplineHead
 
 
 class ProTEncoder(nn.Module):
@@ -164,14 +165,29 @@ class ProTEncoder(nn.Module):
         n_head_outputs: Optional[int] = None,  # per-head output width (default: out_dim)
         head_hidden_dim: Optional[int] = None, # per-head MLP hidden dim (None: single Linear)
         head_var_embed: bool = False,      # add a per-head embedding to the pool queries
+
+        # spline_per_var head (see spline_head.py)
+        spline_n_basis: int = 16,          # number of I-spline coefficients K
+        spline_rank: int = 2,              # rank of the coefficient covariance factor
+        spline_hidden: int = 128,          # per-variable MLP hidden width
+        spline_knot_power: float = 1.0,    # >1: denser knots near the end
+        spline_t_max: Optional[float] = None,  # horizon; None = L_dec // n_dec_vars
+        spline_var_min: float = 1e-4,      # floor on the coefficient variance
+        spline_noise_min: float = 1e-4,    # floor on the observation noise
         ):
         super().__init__()
 
-        assert head_type in ["scalar", "gru", "gru_per_var"], \
-            f"head_type must be 'scalar', 'gru' or 'gru_per_var', got {head_type}"
+        assert head_type in ["scalar", "gru", "gru_per_var", "spline_per_var"], \
+            f"head_type must be 'scalar', 'gru', 'gru_per_var' or " \
+            f"'spline_per_var', got {head_type}"
         if head_type == "scalar":
             assert output_dim is not None and output_dim > 0, \
                 "output_dim must be a positive integer for the scalar head"
+        if head_type == "spline_per_var":
+            assert n_dec_vars is not None and n_dec_vars > 0 \
+                and dec_var_idx is not None, \
+                "spline_per_var requires n_dec_vars and dec_var_idx"
+            assert out_dim == 2, "spline_per_var requires out_dim=2 (mu, raw_sigma)"
         if head_type == "gru_per_var":
             assert n_dec_vars is not None and n_dec_vars > 0, \
                 "n_dec_vars must be a positive integer for the gru_per_var head"
@@ -348,6 +364,14 @@ class ProTEncoder(nn.Module):
                     ) if head_hidden_dim is not None else
                     nn.Linear(d_model_enc, self.n_head_outputs, bias=True)
                     for _ in range(n_output_heads)])
+        elif head_type == "spline_per_var":
+            # functional head: per-variable MLP -> Gaussian over I-spline
+            # coefficients, conditioned in closed form on given positions
+            self.spline_head = SplineHead(
+                n_vars=n_dec_vars, ctx_dim=n_ctx_queries * d_model_enc,
+                n_basis=spline_n_basis, rank=spline_rank, hidden=spline_hidden,
+                var_min=spline_var_min, noise_min=spline_noise_min,
+                knot_power=spline_knot_power, t_max=spline_t_max)
         else:
             # target covariate embedding for the GRU inputs
             self.dec_embedding = ModularEmbedding(
@@ -548,6 +572,8 @@ class ProTEncoder(nn.Module):
                     dim=1)  # (B, n_output_heads, n_head_outputs)
         elif self.head_type == "gru":
             forecast_out = self._gru_rollout(context, target_tensor, trg_pos_mask)
+        elif self.head_type == "spline_per_var":
+            forecast_out = self._spline_forward(context, target_tensor, trg_pos_mask)
         else:
             forecast_out = self._gru_rollout_per_var(context, target_tensor, trg_pos_mask)
 
@@ -555,6 +581,38 @@ class ProTEncoder(nn.Module):
 
         return forecast_out, recon_out, (enc_self_att, [], [pool_att]), enc_mask, \
             (enc_self_ent, [], [])
+
+    def _spline_forward(self, context, target_tensor, trg_pos_mask):
+        """Spline head: predictive (mu, raw_sigma) at every target token.
+
+        Given AND observed positions (trg_pos_mask == False, value not NaN)
+        condition the coefficients exactly (Kalman update, see SplineHead);
+        all positions, given ones included, get the posterior predictive.
+        """
+        B, L_dec, _ = target_tensor.shape
+        head = self.spline_head
+        if float(head.t_max) <= 0:
+            # shared physical axis: horizon = per-variable padded length
+            head.t_max.fill_(float(L_dec // self.n_dec_vars))
+        if context.dim() == 2:
+            context = context.unsqueeze(1)                    # (B, 1, d)
+        context = context.reshape(B, self.n_dec_vars, -1)     # (B, V, k*d)
+
+        pos = target_tensor[:, :, self.dec_pos_idx]
+        var_ids = torch.nan_to_num(target_tensor[:, :, self.dec_var_idx], nan=0.0).long()
+        real_val = target_tensor[:, :, self.dec_val_idx]
+        obs = ~torch.isnan(real_val)
+        real_val = torch.nan_to_num(real_val)
+        z_real = torch.log((real_val + self.feedback_shift).clamp_min(1e-8)) \
+            if self.feedback_shift is not None else real_val
+        if trg_pos_mask is not None:
+            given = torch.logical_not(trg_pos_mask).squeeze(-1) & obs
+        else:
+            given = torch.zeros_like(obs)
+
+        mu, var = head(context, pos, var_ids, z_real, given, self._delta_z0())
+        outputs = torch.stack([mu, self._raw_sigma_from_var(var)], dim=-1)
+        return self._finish_rollout(outputs, None, target_tensor)
 
     def _feedback_value(self, mu):
         """Value fed back into the GRU at the next autoregressive step.
